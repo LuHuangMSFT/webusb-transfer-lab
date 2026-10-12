@@ -44,9 +44,9 @@ if desired. GitHub project sites on the same `luhuangmsft.github.io` hostname
 share a web origin, not independent path-level security boundaries.
 
 The site bundles its code and dependencies. It does not send generated file
-contents, keys, device identifiers, or measurements to a server. Local cleanup
-records and reports may be stored in your browser. Reports leave the browser
-only when you explicitly export them.
+contents, keys, device identifiers, or measurements to a server. Configuration,
+local cleanup records and reports may be stored in your browser. Reports leave
+the browser only when you explicitly export them.
 
 ## Workloads
 
@@ -95,6 +95,30 @@ control. Do not interpret a failed cleanup as a fully completed run.
 connection when needed. A stuck OS USB request may need the cable disconnected;
 the UI cannot force the Windows kernel to complete it. Reconnect before another
 run if prompted.
+
+### Remembered configuration
+
+All **Configure** fields are saved locally as you edit: file count, rounds,
+file-size value and unit, transfer pattern, seed, tags, and notes. Refreshing or
+reopening the site in the same browser profile restores them, even before you
+have connected a phone or run a test. The initial defaults apply when no saved
+configuration exists. Quick-start presets are saved too; as before, they change
+the file count, size/unit and rounds without clearing the pattern, seed, tags or
+notes.
+
+Unfinished edits, including blank or out-of-range numbers, survive refresh and
+must pass the normal workload validation before a run can start. Unsupported
+or damaged saved data produces a visible warning and leaves the defaults in
+place. If browser storage is blocked or full, a warning explains that current
+edits could not be saved; they remain usable on the page.
+
+These preferences use `localStorage` under `webusb-transfer-lab.settings.v1`,
+separately from reports and cleanup ownership. They stay in this browser
+profile, are not uploaded or logged, and do not sync to another browser or
+computer. Restoring configuration never reconnects a phone, resumes a run, or
+enables diagnostic tracing. To reset just these preferences without deleting
+reports or cleanup records, remove that key in DevTools Application > Local
+Storage and refresh.
 
 ### Optional tags and notes
 

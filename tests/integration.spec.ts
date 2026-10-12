@@ -136,6 +136,13 @@ for (const tags of ['', '=SUM(1,2), cable A']) {
     await expect(page.locator('#saved-reports')).toContainText(tags || 'Untagged run')
     await page.reload()
     await expect(page.locator('#saved-reports')).toContainText(tags || 'Untagged run')
+    await expect(page.locator('#file-count')).toHaveValue('1')
+    await expect(page.locator('#rounds')).toHaveValue('1')
+    await expect(page.locator('#file-size')).toHaveValue('1024')
+    await expect(page.locator('#size-unit')).toHaveValue('1')
+    await expect(page.locator('#tags')).toHaveValue(tags)
+    await expect(page.locator('#connection-badge')).toHaveText('Disconnected')
+    await expect(page.locator('#start')).toBeDisabled()
     const jsonPromise = page.waitForEvent('download')
     await page.locator('#saved-reports button').filter({ hasText: /^JSON$/ }).click()
     const jsonFile = await jsonPromise

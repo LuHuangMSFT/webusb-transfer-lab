@@ -20,6 +20,7 @@ window.addEventListener('unhandledrejection', (event) => {
 
 const SITE_VERSION = '0.1.0'
 const RECENT_FILES = 20
+const SETTINGS_KEY = 'webusb-transfer-lab.settings.v1'
 const environment: Environment = {
   siteCommit: __SITE_COMMIT__,
   siteVersion: SITE_VERSION,
@@ -132,6 +133,8 @@ app.innerHTML = `
             </div>
             <p id="workload-limits" class="hint">Limits: 100 files · 1 GiB per file · 1 GiB of unique payload per round. Byte sizes must be positive whole numbers.</p>
             <p class="hint">Large files use substantial browser memory. Generation, readback and hashing buffer whole files; a 1 GiB file can require several GiB of RAM.</p>
+            <p class="hint">Configuration, tags and notes are remembered in this browser as you edit. Restoring them never connects a device or starts a run.</p>
+            <div id="settings-storage-error" class="notice warning" role="alert" hidden></div>
             <div class="form-divider"></div>
             <h3>Label your results <span class="optional">optional</span></h3>
             <p id="tags-hint" class="hint">Tags and notes are just for your records. They do not change transfers or determine whether reports can be compared. Leave them blank if you don't need them.</p>
@@ -222,6 +225,7 @@ const pattern = element<HTMLSelectElement>('pattern')
 const seed = element<HTMLInputElement>('seed')
 const tags = element<HTMLInputElement>('tags')
 const notes = element<HTMLTextAreaElement>('notes')
+const preferenceControls = { fileCount, fileSize, sizeUnit, rounds, pattern, seed, tags, notes }
 const connectButton = element<HTMLButtonElement>('connect')
 const disconnectButton = element<HTMLButtonElement>('disconnect')
 const cleanupButton = element<HTMLButtonElement>('cleanup-leftovers')
@@ -358,6 +362,64 @@ function readSettings(): Settings {
   })
 }
 
+function restorePreferences(): void {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    if (raw === null) return
+    if (raw.length > 32_768) throw new Error('Saved configuration is too large.')
+    const saved: unknown = JSON.parse(raw)
+    const record = (value: unknown): value is Record<string, unknown> =>
+      value !== null && typeof value === 'object' && !Array.isArray(value)
+    if (!record(saved) || saved.version !== 1 || !record(saved.values)
+      || Object.keys(saved).sort().join(',') !== 'values,version'
+      || Object.keys(saved.values).sort().join(',') !== Object.keys(preferenceControls).sort().join(',')) {
+      throw new Error('Saved configuration has an unsupported format.')
+    }
+    const values = saved.values
+    const restored = Object.entries(preferenceControls).map(([key, control]) => {
+      const value = values[key]
+      const maximum = control instanceof HTMLSelectElement ? 32 : control.maxLength > 0 ? control.maxLength : 128
+      if (typeof value !== 'string' || value.length > maximum
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+        throw new Error('Saved configuration contains unsupported field values.')
+      }
+      if (control instanceof HTMLSelectElement) {
+        if (!Array.from(control.options).some((option) => option.value === value)) {
+          throw new Error('Saved configuration contains an unsupported selection.')
+        }
+      } else {
+        const probe = control instanceof HTMLTextAreaElement
+          ? document.createElement('textarea') : document.createElement('input')
+        if (probe instanceof HTMLInputElement && control instanceof HTMLInputElement) probe.type = control.type
+        probe.value = value
+        if (probe.value !== value) throw new Error('Saved configuration contains malformed field text.')
+      }
+      return { control, value }
+    })
+    // Validate the complete snapshot before changing any visible field.
+    for (const { control, value } of restored) control.value = value
+  } catch (error) {
+    diagnosticError('app.settings.restore.failed', 'Saved configuration could not be restored. Review the defaults before running.', error)
+    message('settings-storage-error', 'Saved configuration could not be restored. Defaults are shown. Changing a field will try saving again.')
+  }
+}
+
+function settingsChanged(): void {
+  updateSettings()
+  try {
+    const raw = JSON.stringify({
+      version: 1,
+      values: Object.fromEntries(Object.entries(preferenceControls).map(([key, control]) => [key, control.value])),
+    })
+    localStorage.setItem(SETTINGS_KEY, raw)
+    if (localStorage.getItem(SETTINGS_KEY) !== raw) throw new Error('Configuration persistence could not be confirmed.')
+    message('settings-storage-error', '')
+  } catch (error) {
+    diagnosticError('app.settings.save.failed', 'Configuration could not be saved. Allow site storage or free space before refreshing.', error)
+    message('settings-storage-error', 'Current configuration could not be saved for refresh. Your edits remain on this page; allow site storage or free space, then edit a field to retry.')
+  }
+}
+
 function updateSettings(): void {
   fileSize.min = String(1 / Number(sizeUnit.value))
   fileSize.max = String(LIMITS.maxFileBytes / Number(sizeUnit.value))
@@ -428,7 +490,7 @@ function setPreset(count: number, sizeMiB: number, repetitions: number): void {
   sizeUnit.value = '1048576'
   fileSize.step = 'any'
   rounds.value = String(repetitions)
-  updateSettings()
+  settingsChanged()
 }
 
 fileCount.value = String(DEFAULT_SETTINGS.fileCount)
@@ -437,6 +499,7 @@ fileSize.step = 'any'
 rounds.value = String(DEFAULT_SETTINGS.rounds)
 pattern.value = DEFAULT_SETTINGS.pattern
 seed.value = DEFAULT_SETTINGS.seed
+restorePreferences()
 element('site-version').textContent = SITE_VERSION
 element('site-commit').textContent = environment.siteCommit
 diagnosticCheckbox.addEventListener('change', () => {
@@ -464,8 +527,8 @@ element('clear-diagnostics').addEventListener('click', () => {
   clearDiagnostics()
   element('diagnostic-status').textContent = 'In-page diagnostic history cleared. Clear the DevTools Console separately.'
 })
-form.addEventListener('input', updateSettings)
-form.addEventListener('change', updateSettings)
+form.addEventListener('input', settingsChanged)
+form.addEventListener('change', settingsChanged)
 element('preset-default').addEventListener('click', () => setPreset(10, 1, 3))
 element('preset-small').addEventListener('click', () => setPreset(100, 0.0625, 3))
 element('preset-large').addEventListener('click', () => setPreset(8, 16, 3))
