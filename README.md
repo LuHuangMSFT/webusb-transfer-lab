@@ -6,6 +6,35 @@ read the actual files back, and verify byte counts and SHA-256.
 
 Public site: **https://luhuangmsft.github.io/webusb-transfer-lab/**
 
+## Install as a Windows app
+
+Open the site in the desktop Chromium browser you want to use. Choose the
+address-bar install icon, the browser's **Apps / Install** menu, or the site's
+**Install app** button when the browser offers it. Installation is optional:
+the regular browser tab remains fully supported. Browser policy, a previously
+dismissed prompt, or an existing installation can affect which install UI is
+available.
+
+The PWA launches **WebUSB Transfer Lab** in its own app window. It uses the same
+browser engine, profile, origin permissions, saved configuration and reports as
+the tab it was installed from. It does not install an Android app or replace
+the native WebUSB/WinUSB backend. For A/B testing, confirm the browser build
+that launches each app; installation does not pin a browser version.
+
+Install while disconnected and idle. The site's install button is disabled
+during connection, transfers, cleanup, report operations and while a phone is
+connected. Installation never automatically reconnects a device or starts a
+run. The manifest identity, launch URL and scope are confined to
+`/webusb-transfer-lab/`.
+
+This is an **online, installable PWA**, not an offline cache of the lab. Modern
+Chromium does not require a service worker for installation. Deliberately
+keeping service workers and background caching out avoids stale site code and
+extra background work during profiling. Internet access is required to load
+the app. Updates take effect on a manual refresh or a subsequent launch, not by
+automatically reloading an active transfer. Check the displayed site commit
+when comparing runs.
+
 ## Phone and laptop setup
 
 1. Use a desktop Chromium-based browser with WebUSB support.
@@ -237,8 +266,9 @@ npm run test:browser
 The production site is built in `dist`. Browser integration tests additionally
 use a development-only harness with simulated device storage; the harness is
 not included in the production build. The Vite base path is
-`/webusb-transfer-lab/`, including worker and asset URLs. The deployed commit is
-shown on the page. No service worker is installed.
+`/webusb-transfer-lab/`, including the manifest, icons, worker and asset URLs.
+The deployed commit is shown on the page. PWA installation is manifest-only;
+no service worker is registered.
 
 Unit and browser tests use fake transports where hardware is needed. They test
 validation, ordering, corruption, error handling and UI behavior, **not actual

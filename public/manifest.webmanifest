@@ -1,0 +1,27 @@
+{
+  "id": "./",
+  "name": "WebUSB Transfer Lab",
+  "short_name": "WebUSB Lab",
+  "description": "Round-trip generated files to an Android phone over WebUSB and verify their integrity.",
+  "lang": "en",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "theme_color": "#006b60",
+  "background_color": "#f4f7f7",
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "icons/app-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/app-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

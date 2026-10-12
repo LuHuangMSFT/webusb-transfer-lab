@@ -2,6 +2,7 @@ import './style.css'
 import { AdbClient } from './adb-client'
 import { createPayloadService } from './payload'
 import { runWorkload } from './runner'
+import { setupInstall } from './install'
 import { DEFAULT_SETTINGS, estimateWorkload, LIMITS, validateSettings } from './workload'
 import {
   aggregateResults, compareSummaries, MAX_IMPORT_BYTES, parseReportJson, reportLabel, ReportStore,
@@ -41,6 +42,7 @@ app.innerHTML = `
     <a class="wordmark" href="#main" aria-label="WebUSB Transfer Lab home"><span class="brand-mark" aria-hidden="true">↔</span> WebUSB <span>Transfer Lab</span></a>
     <nav aria-label="Page sections"><a href="#setup">Setup</a><a href="#workload">Workload</a><a href="#reports">Reports</a></nav>
     <span class="local-badge">Local-only · no uploads</span>
+    <button id="install-app" type="button" hidden>Install app</button>
   </header>
   <main id="main">
     <section class="hero" aria-labelledby="page-title">
@@ -58,6 +60,7 @@ app.innerHTML = `
 
     <div id="app-error" class="notice error" role="alert" hidden></div>
     <div id="storage-error" class="notice error" role="alert" hidden></div>
+    <p id="install-status" class="hint" role="status" hidden></p>
 
     <section id="diagnostics" class="panel" aria-label="Diagnostic controls">
       <details>
@@ -101,6 +104,10 @@ app.innerHTML = `
               <li>Close Android Studio, native ADB servers, and other clients that may own the interface. Disable <strong>Discover USB devices</strong> in <code>chrome://inspect</code>.</li>
               <li>Click Connect, select the phone, then approve its <strong>Allow USB debugging?</strong> prompt. An empty chooser usually means a cable, debugging, driver, or interface issue.</li>
             </ol>
+            <h3>Install as a Windows app</h3>
+            <p>Use <strong>Install app</strong> above when available, the address-bar install icon, or your browser's Apps / Install menu. Install while disconnected. If installation is unavailable, the normal tab still works.</p>
+            <p>The app uses the browser and profile you install from, including its WebUSB backend, settings and reports. Install from the browser build you intend to profile; installation does not pin that build.</p>
+            <p>Internet access is required to load the app. There is no offline service worker, background cache update or automatic page reload. Finish transfers before manually refreshing for site updates.</p>
           </div>
           <div><h3>Know what you authorize</h3>
             <p>ADB authorization gives this browser session <strong>broad debugging access</strong> to your phone. This app only generates files in its own temporary directory under <code>/data/local/tmp</code>; it has no personal-file picker, path input, or shell terminal.</p>
@@ -268,6 +275,7 @@ const client = new AdbClient(() => {
   updateControls()
   refreshLeftovers()
 })
+const installer = setupInstall(element<HTMLButtonElement>('install-app'), element('install-status'), updateControls)
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -459,7 +467,8 @@ function updateSettings(): void {
 }
 
 function updateControls(): void {
-  const busy = running || cleaning || connecting || disconnecting
+  const busy = running || cleaning || connecting || disconnecting || installer.prompting
+  installer.refresh(busy || reportsBusy || client.connected)
   diagnosticCheckbox.disabled = busy || reportsBusy
   element<HTMLButtonElement>('download-diagnostics').disabled = busy || reportsBusy
   element<HTMLButtonElement>('clear-diagnostics').disabled = busy || reportsBusy
