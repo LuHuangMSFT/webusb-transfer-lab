@@ -126,11 +126,12 @@ app.innerHTML = `
               <div class="field"><label for="file-count">Files per round</label><input id="file-count" type="number" min="1" max="100" step="1" required aria-describedby="workload-limits"></div>
               <div class="field"><label for="rounds">Rounds</label><input id="rounds" type="number" min="1" step="1" required aria-describedby="rounds-hint"><small id="rounds-hint">Same workload, repeated sequentially</small></div>
               <div class="field"><label for="file-size">File size</label><input id="file-size" type="number" min="1" step="1" required aria-describedby="workload-limits"></div>
-              <div class="field"><label for="size-unit">Size unit</label><select id="size-unit"><option value="1">Bytes</option><option value="1024">KiB (1,024 bytes)</option><option value="1048576" selected>MiB (1,048,576 bytes)</option></select></div>
+              <div class="field"><label for="size-unit">Size unit</label><select id="size-unit"><option value="1">Bytes</option><option value="1024">KiB (1,024 bytes)</option><option value="1048576" selected>MiB (1,048,576 bytes)</option><option value="1073741824">GiB (1,073,741,824 bytes)</option></select></div>
               <div class="field full"><label for="pattern">Transfer pattern</label><select id="pattern"><option value="round-trip">Per-file round trip — write, read, verify, delete</option><option value="batch">Batch — upload all, then read, verify & delete each</option></select></div>
               <div class="field full"><label for="seed">Reproducible seed</label><input id="seed" type="text" maxlength="128" required spellcheck="false" autocomplete="off" aria-describedby="seed-hint"><small id="seed-hint">Keep the same seed and workload settings when comparing runs.</small></div>
             </div>
-            <p id="workload-limits" class="hint">Limits: 100 files · 16 MiB per file · 1 GiB of unique payload per round. Byte sizes must be positive whole numbers.</p>
+            <p id="workload-limits" class="hint">Limits: 100 files · 1 GiB per file · 1 GiB of unique payload per round. Byte sizes must be positive whole numbers.</p>
+            <p class="hint">Large files use substantial browser memory. Generation, readback and hashing buffer whole files; a 1 GiB file can require several GiB of RAM.</p>
             <div class="form-divider"></div>
             <h3>Label your results <span class="optional">optional</span></h3>
             <p id="tags-hint" class="hint">Tags and notes are just for your records. They do not change transfers or determine whether reports can be compared. Leave them blank if you don't need them.</p>
@@ -359,6 +360,7 @@ function readSettings(): Settings {
 
 function updateSettings(): void {
   fileSize.min = String(1 / Number(sizeUnit.value))
+  fileSize.max = String(LIMITS.maxFileBytes / Number(sizeUnit.value))
   const sizeBytes = fileSize.valueAsNumber * Number(sizeUnit.value)
   const validInteger = (value: number, max = Number.MAX_SAFE_INTEGER): boolean => Number.isSafeInteger(value) && value >= 1 && value <= max
   fileCount.setAttribute('aria-invalid', String(!validInteger(fileCount.valueAsNumber, LIMITS.maxFiles)))

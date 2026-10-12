@@ -4,36 +4,40 @@ import { join } from 'node:path'
 import type {} from './harness'
 import type { PayloadReply } from '../src/payload'
 
-test('production worker loads at the Pages base and hashes actual returned bytes', async ({ page }) => {
-  const filename = (await readdir(join('dist', 'assets'))).find((name) => name.startsWith('payload.worker-') && name.endsWith('.js'))
-  expect(filename).toBeDefined()
-  await page.goto('./')
-  const result = await page.evaluate(async (url) => {
-    const worker = new Worker(url, { type: 'module' })
-    try {
-      const prepared = await new Promise<PayloadReply>((resolve, reject) => {
-        worker.onmessage = (event) => resolve(event.data)
-        worker.onerror = (event) => reject(new Error(event.message))
-        worker.postMessage({ id: 1, operation: 'prepare', size: 1024, seed: 'test', index: 1 })
-      })
-      if ('error' in prepared || prepared.operation !== 'prepare') throw new Error('Unexpected worker reply')
-      const digest = await crypto.subtle.digest('SHA-256', prepared.buffer)
-      const expected = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
-      const received = new Uint8Array(prepared.buffer).slice()
-      received[0] ^= 1
-      const hashed = await new Promise<PayloadReply>((resolve, reject) => {
-        worker.onmessage = (event) => resolve(event.data)
-        worker.onerror = (event) => reject(new Error(event.message))
-        worker.postMessage({ id: 2, operation: 'hash', buffer: received.buffer }, [received.buffer])
-      })
-      if ('error' in hashed) throw new Error(hashed.error)
-      return { originalMatches: prepared.sha256 === expected, corruptionDetected: prepared.sha256 !== hashed.sha256 }
-    } finally {
-      worker.terminate()
-    }
-  }, `/webusb-transfer-lab/assets/${filename}`)
-  expect(result).toEqual({ originalMatches: true, corruptionDetected: true })
-})
+for (const size of [1024, 1024 ** 3]) {
+  test(`production worker generates and verifies ${size} bytes at the Pages base`, async ({ page }) => {
+    test.setTimeout(180_000)
+    const filename = (await readdir(join('dist', 'assets'))).find((name) => name.startsWith('payload.worker-') && name.endsWith('.js'))
+    expect(filename).toBeDefined()
+    await page.goto('./')
+    const result = await page.evaluate(async ({ url, size }) => {
+      const worker = new Worker(url, { type: 'module' })
+      try {
+        const prepared = await new Promise<PayloadReply>((resolve, reject) => {
+          worker.onmessage = (event) => resolve(event.data)
+          worker.onerror = (event) => reject(new Error(event.message))
+          worker.postMessage({ id: 1, operation: 'prepare', size, seed: 'test', index: 1 })
+        })
+        if ('error' in prepared || prepared.operation !== 'prepare') throw new Error('Unexpected worker reply')
+        const digest = await crypto.subtle.digest('SHA-256', prepared.buffer)
+        const expected = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+        const byteLength = prepared.buffer.byteLength
+        const received = new Uint8Array(prepared.buffer)
+        received[0] ^= 1
+        const hashed = await new Promise<PayloadReply>((resolve, reject) => {
+          worker.onmessage = (event) => resolve(event.data)
+          worker.onerror = (event) => reject(new Error(event.message))
+          worker.postMessage({ id: 2, operation: 'hash', buffer: received.buffer }, [received.buffer])
+        })
+        if ('error' in hashed) throw new Error(hashed.error)
+        return { byteLength, originalMatches: prepared.sha256 === expected, corruptionDetected: prepared.sha256 !== hashed.sha256 }
+      } finally {
+        worker.terminate()
+      }
+    }, { url: `/webusb-transfer-lab/assets/${filename}`, size })
+    expect(result).toEqual({ byteLength: size, originalMatches: true, corruptionDetected: true })
+  })
+}
 
 for (const pattern of ['round-trip', 'batch'] as const) {
   test(`browser worker, ${pattern} runner and real IndexedDB round-trip through exports (simulated device)`, async ({ page }) => {

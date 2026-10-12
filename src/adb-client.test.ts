@@ -3,6 +3,7 @@ import { ReadableStream } from '@yume-chan/stream-extra'
 import type { AdbCredentialStore, AdbPrivateKey } from '@yume-chan/adb'
 import { AdbClient, parseAvailableBytes } from './adb-client'
 import { clearDiagnostics, diagnosticSnapshot, setDiagnosticsEnabled } from './diagnostics'
+import { hashPayload } from './workload'
 
 // These are protocol-boundary mocks, not real USB or phone verification.
 const boundary = vi.hoisted(() => ({
@@ -19,6 +20,7 @@ vi.mock('@yume-chan/adb-daemon-webusb', () => ({
   },
 }))
 vi.mock('@yume-chan/adb', () => ({
+  ADB_SYNC_MAX_PACKET_SIZE: 64 * 1024,
   LinuxFileType: { Directory: 4, File: 8, Link: 10 },
   AdbDaemonTransport: { authenticate: boundary.authenticate },
   Adb: class {
@@ -104,11 +106,19 @@ function makeFixture() {
       }) => {
         const records = JSON.parse(memory.get(KEY)!) as Saved[]
         expect(records.some((record) => record.files.includes(options.filename.split('/').at(-1)!))).toBe(true)
-        const reader = options.file.getReader()
-        const { value } = await reader.read()
-        expect((await reader.read()).done).toBe(true)
-        reader.releaseLock()
-        entries.set(options.filename, entry(8, new Uint8Array(value!)))
+        const chunks: Uint8Array[] = []
+        let length = 0
+        for await (const chunk of options.file) {
+          chunks.push(chunk.slice())
+          length += chunk.byteLength
+        }
+        const bytes = new Uint8Array(length)
+        let offset = 0
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset)
+          offset += chunk.byteLength
+        }
+        entries.set(options.filename, entry(8, bytes))
       }),
     },
     spawn: vi.fn(async (command: string[]) => {
@@ -366,6 +376,14 @@ describe('owned paths and capability checks', () => {
     expect(fixture.commands.filter((command) => command[0] === 'df')).toHaveLength(3)
   })
 
+  it('requires 1 GiB plus headroom for a maximum-sized workload', async () => {
+    await client.connect()
+    await expect(client.checkSpace(1024 ** 3)).rejects.toThrow('64 MiB')
+    fixture.df = 'Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/data 2097152 983040 1114112 47% /data'
+    await client.checkSpace(1024 ** 3)
+    await expect(client.checkSpace(1024 ** 3 + 1)).rejects.toThrow('Invalid peak')
+  })
+
   it('fails rather than assuming space when df is malformed or denied', async () => {
     await createRun()
     fixture.df = 'unknown'
@@ -459,7 +477,59 @@ describe('bounded actual SYNC transfers', () => {
     expect(saved()[0]!.files).toEqual([NAME])
   })
 
-  it.each([0, -1, 0.5, NaN, Infinity, 16 * 1024 * 1024 + 1])('rejects invalid expected byte limits %s before reading', async (size) => {
+  it('preserves a partial final SYNC packet above the former 16 MiB cap', async () => {
+    await createRun()
+    const data = new Uint8Array(16 * 1024 ** 2 + 7)
+    data[0] = 7
+    data[data.length - 1] = 9
+    const expectedHash = await hashPayload(data)
+    await client.writeFile(RUN, NAME, data)
+    data.fill(0)
+    expect(await hashPayload(await client.readFile(RUN, NAME, data.length))).toBe(expectedHash)
+  })
+
+  it('uploads and independently reads exactly 1 GiB through the actual adapter', async () => {
+    await createRun()
+    const data = new Uint8Array(1024 ** 3)
+    data[0] = 7
+    data[data.length - 1] = 9
+    const expectedHash = await hashPayload(data)
+    let uploaded = 0
+    let packets = 0
+    fixture.sync.write.mockImplementationOnce(async ({ filename, file }) => {
+      for await (const chunk of file) {
+        expect(chunk.byteLength).toBe(64 * 1024)
+        expect(chunk.buffer).toBe(data.buffer)
+        expect(chunk.byteOffset).toBe(uploaded)
+        uploaded += chunk.byteLength
+        packets++
+      }
+      fixture.entries.set(filename, { ...fixture.entry(8), size: BigInt(uploaded) })
+    })
+    await client.writeFile(RUN, NAME, data)
+    expect(uploaded).toBe(1024 ** 3)
+    expect(packets).toBe(16384)
+    expect(await client.statFile(RUN, NAME)).toBe(1024 ** 3)
+    let offset = 0
+    fixture.sync.read.mockReturnValueOnce(new ReadableStream({
+      pull(controller) {
+        controller.enqueue(data.subarray(offset, offset + 64 * 1024))
+        offset += 64 * 1024
+        if (offset === data.length) controller.close()
+      },
+    }))
+    const returned = await client.readFile(RUN, NAME, data.length)
+    expect(returned.buffer).not.toBe(data.buffer)
+    expect(returned.byteLength).toBe(1024 ** 3)
+    expect(await hashPayload(returned)).toBe(expectedHash)
+    fixture.entries.get(`${PATH}/${NAME}`)!.size++
+    await expect(client.statFile(RUN, NAME)).rejects.toThrow('1 GiB')
+    await client.removeFile(RUN, NAME)
+    await client.cleanupRun(RUN)
+    expect(saved()).toEqual([])
+  }, 60_000)
+
+  it.each([0, -1, 0.5, NaN, Infinity, 1024 ** 3 + 1])('rejects invalid expected byte limits %s before reading', async (size) => {
     await expect(client.readFile(RUN, NAME, size)).rejects.toThrow(/size/)
     expect(fixture.sync.read).not.toHaveBeenCalled()
   })
@@ -543,6 +613,93 @@ describe('bounded actual SYNC transfers', () => {
     await vi.advanceTimersByTimeAsync(120_001)
     await rejected
     expect(client.connected).toBe(false)
+  })
+
+  it('allows an upload to exceed two minutes while SYNC consumes chunks', async () => {
+    await createRun()
+    vi.useFakeTimers()
+    const data = new Uint8Array(4 * 64 * 1024)
+    let uploaded = 0
+    fixture.sync.write.mockImplementationOnce(async ({ filename, file }) => {
+      for await (const chunk of file) {
+        await new Promise((resolve) => setTimeout(resolve, 45_000))
+        uploaded += chunk.byteLength
+      }
+      fixture.entries.set(filename, { ...fixture.entry(8), size: BigInt(uploaded) })
+    })
+    const completed = expect(client.writeFile(RUN, NAME, data)).resolves.toBeUndefined()
+    await vi.advanceTimersByTimeAsync(180_001)
+    await completed
+    expect(uploaded).toBe(data.length)
+    expect(client.connected).toBe(true)
+  })
+
+  it('allows a download to exceed two minutes while receiving data', async () => {
+    await createRun()
+    await client.writeFile(RUN, NAME, new Uint8Array([1, 2, 3, 4]))
+    vi.useFakeTimers()
+    let next = 1
+    fixture.sync.read.mockReturnValueOnce(new ReadableStream({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 45_000))
+        controller.enqueue(new Uint8Array([next++]))
+        if (next === 5) controller.close()
+      },
+    }))
+    const completed = expect(client.readFile(RUN, NAME, 4)).resolves.toEqual(new Uint8Array([1, 2, 3, 4]))
+    await vi.advanceTimersByTimeAsync(180_001)
+    await completed
+    expect(client.connected).toBe(true)
+  })
+
+  it('times out two minutes after the last download progress', async () => {
+    await createRun()
+    await client.writeFile(RUN, NAME, new Uint8Array(4))
+    vi.useFakeTimers()
+    fixture.sync.read.mockReturnValueOnce(new ReadableStream({
+      start(controller) {
+        setTimeout(() => controller.enqueue(new Uint8Array([1])), 90_000)
+        fixture.onClose = () => controller.error(new Error('USB closed'))
+      },
+    }))
+    const rejected = expect(client.readFile(RUN, NAME, 4)).rejects.toThrow(/timed out/)
+    await vi.advanceTimersByTimeAsync(120_001)
+    expect(client.connected).toBe(true)
+    await vi.advanceTimersByTimeAsync(90_000)
+    await rejected
+    expect(client.connected).toBe(false)
+  })
+
+  it('does not count empty download chunks as progress', async () => {
+    await createRun()
+    await client.writeFile(RUN, NAME, new Uint8Array(4))
+    vi.useFakeTimers()
+    fixture.sync.read.mockReturnValueOnce(new ReadableStream({
+      start(controller) {
+        const interval = setInterval(() => controller.enqueue(new Uint8Array()), 30_000)
+        fixture.onClose = () => {
+          clearInterval(interval)
+          controller.error(new Error('USB closed'))
+        }
+      },
+    }))
+    const rejected = expect(client.readFile(RUN, NAME, 4)).rejects.toThrow(/timed out/)
+    await vi.advanceTimersByTimeAsync(120_001)
+    await rejected
+    expect(client.connected).toBe(false)
+  })
+
+  it('times out a stuck upload despite readable-stream prefetch', async () => {
+    await createRun()
+    vi.useFakeTimers()
+    fixture.sync.write.mockImplementationOnce(() => new Promise((_, reject) => {
+      fixture.onClose = () => reject(new Error('USB closed'))
+    }))
+    const rejected = expect(client.writeFile(RUN, NAME, new Uint8Array(256 * 1024))).rejects.toThrow(/timed out/)
+    await vi.advanceTimersByTimeAsync(120_001)
+    await rejected
+    expect(client.connected).toBe(false)
+    expect(saved()[0]!.files).toEqual([NAME])
   })
 })
 

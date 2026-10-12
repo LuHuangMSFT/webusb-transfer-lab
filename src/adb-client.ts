@@ -1,17 +1,17 @@
-import { Adb, AdbDaemonTransport, LinuxFileType } from '@yume-chan/adb'
+import { Adb, AdbDaemonTransport, ADB_SYNC_MAX_PACKET_SIZE, LinuxFileType } from '@yume-chan/adb'
 import type { AdbCredentialStore, AdbPrivateKey, AdbSync, AdbSyncStat } from '@yume-chan/adb'
 import { AdbDaemonWebUsbDeviceManager } from '@yume-chan/adb-daemon-webusb'
 import { ReadableStream } from '@yume-chan/stream-extra'
 import type { DeviceInfo, DeviceStorage } from './types'
 import { diagnosticError, diagnosticsEnabled, trace } from './diagnostics'
 import type { DiagnosticContext } from './diagnostics'
+import { LIMITS } from './workload'
 
 const ROOT = '/data/local/tmp'
 const PREFIX = `${ROOT}/webusb-transfer-lab-`
 const STORAGE_KEY = 'webusb-transfer-lab.cleanup.v1'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const FILE = /^r([0-9]{6,16})-f([0-9]{3})\.bin$/
-const MAX_FILE = 16 * 1024 * 1024
 const HEADROOM = 64 * 1024 * 1024
 const IO_TIMEOUT = 120_000
 const SHELL_TIMEOUT = 15_000
@@ -63,8 +63,8 @@ function requireName(value: string): void {
 }
 
 function requireSize(value: number): void {
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_FILE) {
-    throw new Error('File size must be between 1 byte and 16 MiB.')
+  if (!Number.isSafeInteger(value) || value < 1 || value > LIMITS.maxFileBytes) {
+    throw new Error('File size must be between 1 byte and 1 GiB.')
   }
 }
 
@@ -348,7 +348,7 @@ export class AdbClient implements DeviceStorage {
   }
 
   async checkSpace(peakBytes: number): Promise<void> {
-    if (!Number.isSafeInteger(peakBytes) || peakBytes < 1 || peakBytes > 1024 * 1024 * 1024) {
+    if (!Number.isSafeInteger(peakBytes) || peakBytes < 1 || peakBytes > LIMITS.maxRoundBytes) {
       throw new Error('Invalid peak storage requirement.')
     }
     await this.#operate((session) => this.#space(session, peakBytes), { operation: 'check space', bytes: peakBytes })
@@ -422,27 +422,38 @@ export class AdbClient implements DeviceStorage {
     }
   }
 
-  async #wait<T>(session: Session, label: string, operation: () => PromiseLike<T>, timeout = IO_TIMEOUT): Promise<T> {
+  async #wait<T>(session: Session, label: string, operation: (progress: () => void) => PromiseLike<T>, timeout = IO_TIMEOUT): Promise<T> {
     this.#assert(session)
     const context = { ...session.context, session: session.id, operation: label }
     const start = diagnosticsEnabled() ? performance.now() : 0
     trace('adb.wait.start', { ...context, timeoutMs: timeout })
     let status = 'failed'
+    let deadline = performance.now() + timeout
     let timer: ReturnType<typeof setTimeout> | undefined
     let canceled: (() => void) | undefined
     const stopped = new Promise<never>((_, reject) => {
       canceled = () => reject(session.cancellation.signal.reason)
       session.cancellation.signal.addEventListener('abort', canceled, { once: true })
-      timer = setTimeout(() => {
+      const checkTimeout = () => {
+        const remaining = deadline - performance.now()
+        if (remaining > 0) {
+          timer = setTimeout(checkTimeout, remaining)
+          return
+        }
         const failure = new Error(`${label} timed out. USB was invalidated; reconnect before retrying.`)
         diagnosticError('adb.timeout', 'Operation timed out. Reconnect; unplug the cable if teardown also stalls.',
           failure, { ...context, timeoutMs: timeout, pending: this.#pending.size })
         this.#invalidate(session, failure)
-      }, timeout)
+      }
+      timer = setTimeout(checkTimeout, timeout)
     })
     const work = Promise.resolve().then(() => {
       this.#assert(session)
-      return operation()
+      return operation(() => {
+        this.#assert(session)
+        // Advance the deadline without creating a timer for every SYNC packet.
+        deadline = performance.now() + timeout
+      })
     })
     this.#pending.add(work)
     void work.then(() => this.#pending.delete(work), () => this.#pending.delete(work))
@@ -617,7 +628,7 @@ export class AdbClient implements DeviceStorage {
   }
 
   #size(stat: AdbSyncStat): number {
-    if (stat.size < 0n || stat.size > BigInt(MAX_FILE)) throw new Error('Phone file exceeds the 16 MiB limit.')
+    if (stat.size < 0n || stat.size > BigInt(LIMITS.maxFileBytes)) throw new Error('Phone file exceeds the 1 GiB limit.')
     return Number(stat.size)
   }
 
@@ -698,17 +709,23 @@ export class AdbClient implements DeviceStorage {
     }
     record.files.push(name)
     this.#save(record)
-    const file = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(data)
-        controller.close()
-      },
-    })
     try {
       // Stable SYNC v2 defaults to no compression; do not use dry-run or retry.
-      await this.#wait(session, 'File upload', () => session.sync!.write({
-        filename: path, file, type: LinuxFileType.File, permission: 0o600, dryRun: false,
-      }))
+      await this.#wait(session, 'File upload', (progress) => {
+        let offset = 0
+        const file = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            progress()
+            const end = Math.min(offset + ADB_SYNC_MAX_PACKET_SIZE, data.byteLength)
+            controller.enqueue(data.subarray(offset, end))
+            offset = end
+            if (offset === data.byteLength) controller.close()
+          },
+        })
+        return session.sync!.write({
+          filename: path, file, type: LinuxFileType.File, permission: 0o600, dryRun: false,
+        })
+      })
     } catch (error) {
       const failure = error instanceof Error && session.cancellation.signal.reason === error ? error
         : new Error('Phone file upload failed; reconnect for scoped cleanup.', { cause: error })
@@ -725,7 +742,7 @@ export class AdbClient implements DeviceStorage {
       throw new Error('Phone file size does not match the expected byte count.')
     }
     const buffer = new Uint8Array(expected)
-    return this.#wait(session, 'File download', async () => {
+    return this.#wait(session, 'File download', async (progress) => {
       const reader = session.sync!.read(this.#filePath(record, name)).getReader()
       let offset = 0
       try {
@@ -740,6 +757,7 @@ export class AdbClient implements DeviceStorage {
           if (value.byteLength > expected - offset) throw new Error('Phone file download exceeded the expected byte count.')
           buffer.set(value, offset)
           offset += value.byteLength
+          if (value.byteLength) progress()
         }
       } catch (error) {
         const failure = error instanceof Error && /download (was truncated|exceeded)/.test(error.message)

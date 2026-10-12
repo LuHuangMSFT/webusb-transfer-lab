@@ -131,6 +131,26 @@ describe('strict, privacy-bounded report import', () => {
     expect(parsed.run.settings).not.toBe(source.run.settings)
   })
 
+  it('preserves 1 GiB files and multi-GiB totals in JSON and CSV', () => {
+    const report = fixture()
+    report.run.settings.fileCount = 1
+    report.run.settings.fileSizeBytes = 1024 ** 3
+    report.files = report.files.filter((file) => file.index === 1).map((file) => ({
+      ...file, bytes: 1024 ** 3, uploadedBytes: 1024 ** 3, downloadedBytes: 1024 ** 3,
+    }))
+    report.run.expectedFiles = report.run.completedFiles = 2
+    Object.assign(report.run.totals, {
+      uploadedBytes: 2 * 1024 ** 3, downloadedBytes: 2 * 1024 ** 3,
+      prepareMs: 8, uploadMs: 30, downloadMs: 60, verifyMs: 6, cleanupMs: 4,
+    })
+    const parsed = parseReportJson(JSON.stringify(report))
+    expect(parsed).toEqual(report)
+    expect(reportToCsv(parsed)).toContain('"1073741824"')
+    expect(reportToCsv(parsed)).toContain('"2147483648"')
+    report.run.settings.fileSizeBytes++
+    expect(() => validateReport(report)).toThrow('File size')
+  })
+
   it('accepts failed partial evidence without claiming it completed', () => {
     expect(validateReport(partial()).run.status).toBe('failed')
   })

@@ -8,12 +8,23 @@ describe('workload validation and deterministic synthetic data', () => {
       fileCount: 10, fileSizeBytes: 1024 ** 2, rounds: 3, pattern: 'round-trip',
       seed: 'webusb-lab', tags: '', notes: '',
     })
-    expect(LIMITS).toEqual({ maxFiles: 100, maxFileBytes: 16 * 1024 ** 2, maxRoundBytes: 1024 ** 3 })
+    expect(LIMITS).toEqual({ maxFiles: 100, maxFileBytes: 1024 ** 3, maxRoundBytes: 1024 ** 3 })
     expect(validateSettings({ ...DEFAULT_SETTINGS, fileCount: 100 })).toBeTruthy()
     expect(validateSettings({ ...DEFAULT_SETTINGS, fileCount: 64, fileSizeBytes: 16 * 1024 ** 2 })).toBeTruthy()
     expect(() => validateSettings({ ...DEFAULT_SETTINGS, fileCount: 65, fileSizeBytes: 16 * 1024 ** 2 })).toThrow('1 GiB')
     expect(() => validateSettings({ ...DEFAULT_SETTINGS, fileCount: 101 })).toThrow()
-    expect(() => validateSettings({ ...DEFAULT_SETTINGS, fileSizeBytes: 16 * 1024 ** 2 + 1 })).toThrow()
+    expect(() => validateSettings({ ...DEFAULT_SETTINGS, fileCount: 1, fileSizeBytes: 1024 ** 3 + 1 })).toThrow('File size')
+    expect(() => generatePayloadBytes(1024 ** 3 + 1, 'seed', 1)).toThrow('Payload size')
+  })
+
+  it.each(['round-trip', 'batch'] as const)('accepts exactly 1 GiB per file with correct %s estimates', (pattern) => {
+    const settings = { ...DEFAULT_SETTINGS, fileCount: 1, fileSizeBytes: 1024 ** 3, pattern }
+    expect(estimateWorkload(settings)).toEqual({
+      roundBytes: 1024 ** 3, totalTrafficBytes: 6 * 1024 ** 3,
+      peakDeviceBytes: 1024 ** 3, totalFiles: 3,
+    })
+    expect(validateSettings({ ...settings, fileCount: 2, fileSizeBytes: 512 * 1024 ** 2 })).toBeTruthy()
+    expect(() => validateSettings({ ...settings, fileCount: 2 })).toThrow('1 GiB')
   })
 
   it.each([0, -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid numerical input %s', (value) => {

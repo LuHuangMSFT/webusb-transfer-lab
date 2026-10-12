@@ -2,7 +2,7 @@ import type { Settings } from './types'
 
 export const LIMITS = Object.freeze({
   maxFiles: 100,
-  maxFileBytes: 16 * 1024 ** 2,
+  maxFileBytes: 1024 ** 3,
   maxRoundBytes: 1024 ** 3,
 })
 

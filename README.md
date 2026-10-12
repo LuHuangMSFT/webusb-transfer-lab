@@ -53,14 +53,27 @@ only when you explicitly export them.
 | Setting | Default | Limit |
 | --- | --- | --- |
 | Files per round | 10 | 100 |
-| Bytes per file | 1 MiB | 16 MiB |
+| Bytes per file | 1 MiB | 1 GiB |
 | Total file payload per round | 10 MiB | 1 GiB |
 | Repetitions | 3 | Positive integer; aggregate totals must be safe |
 | Pattern | Per-file round trip | Per-file or batch |
 
-All limits apply together: 64 files of 16 MiB are allowed, but 65 such files
-exceed the per-round cap. MiB means 1,048,576 bytes. Traffic estimates include
-both upload and download; ADB/USB protocol overhead is additional.
+All limits apply together: one 1 GiB file or two 512 MiB files are allowed per
+round, but two 1 GiB files exceed the per-round cap. MiB means 1,048,576 bytes;
+GiB means 1,073,741,824 bytes. Both are available in the size-unit selector.
+Traffic estimates include both upload and download; ADB/USB protocol overhead
+is additional.
+
+Generation, readback and SHA-256 hashing still buffer whole files in the
+browser. A 1 GiB file can require several GiB of RAM, and memory pressure or
+garbage collection can affect profiles. Close unnecessary tabs and use a smaller
+file if memory is limited. Phone free-space checks still require the peak
+payload plus 64 MiB headroom.
+
+File uploads and downloads time out after 120 seconds without stream progress,
+not after 120 seconds of total transfer time. Uploads feed SYNC in its existing
+64 KiB packet size, with backpressure; downloads reset the deadline only on
+nonempty data. Integrity verification and scoped cleanup are unchanged.
 
 - **Per-file:** generate, upload, read back, verify, delete; then the next file.
   Peak phone payload storage is one file.
