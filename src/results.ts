@@ -62,19 +62,20 @@ function strings(value: unknown, label: string, limit: number, maxLength = 256):
 
 function parseSettings(value: unknown): Settings {
   const source = object(value, 'settings')
-  fields(source, ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed', 'buildLabel', 'architecture', 'notes'])
+  fields(source, ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed', 'notes'], ['tags', 'buildLabel', 'architecture'])
   const pattern = source.pattern
   const architecture = source.architecture
   if (pattern !== 'round-trip' && pattern !== 'batch') invalid('unknown transfer pattern.')
-  if (architecture !== 'arm64' && architecture !== 'x64' && architecture !== 'other') invalid('unknown architecture.')
+  if (architecture !== undefined && architecture !== 'arm64' && architecture !== 'x64' && architecture !== 'other') invalid('unknown architecture.')
   const settings: Settings = {
     fileCount: number(source.fileCount, 'file count', true),
     fileSizeBytes: number(source.fileSizeBytes, 'file size', true),
     rounds: number(source.rounds, 'rounds', true),
     pattern,
     seed: text(source.seed, 'seed', 256),
-    buildLabel: text(source.buildLabel, 'build label', 128),
-    architecture,
+    ...(source.tags === undefined ? {} : { tags: text(source.tags, 'tags', 512, true) }),
+    ...(source.buildLabel === undefined ? {} : { buildLabel: text(source.buildLabel, 'build label', 128) }),
+    ...(architecture === undefined ? {} : { architecture }),
     notes: text(source.notes, 'notes', 4096, true),
   }
   try {
@@ -355,6 +356,12 @@ export interface Comparison {
   wallTimeDeltaPercent: number | null
 }
 
+export function reportLabel(run: RunSummary): string {
+  return run.settings.tags?.trim()
+    || [run.settings.buildLabel, run.settings.architecture].filter(Boolean).join(' · ')
+    || `Untagged run ${run.id.slice(0, 8)}`
+}
+
 export function compareSummaries(left: RunSummary, right: RunSummary): Comparison {
   const differences: string[] = []
   const display = (value: string | number): string => {
@@ -367,17 +374,18 @@ export function compareSummaries(left: RunSummary, right: RunSummary): Compariso
   const warnings = [
     'Descriptive comparison of two runs, not a claim of statistical significance or a WinUSB cause.',
     'Confirm the same physical phone, cable, USB port, driver, power and thermal conditions; model names do not identify a unique phone.',
+    'Tags and notes are bookkeeping only and are not checked for compatibility. Review the test conditions yourself.',
   ]
   if (left.id === right.id) differences.push('The same run was selected twice.')
   for (const run of [left, right]) {
     if (run.environment.diagnosticsEnabled) {
-      differences.push(`${run.settings.buildLabel}: diagnostic tracing was enabled. Repeat with tracing off for a performance comparison.`)
+      differences.push(`${reportLabel(run)}: diagnostic tracing was enabled. Repeat with tracing off for a performance comparison.`)
     }
     if (run.status !== 'completed' || run.completedFiles !== run.expectedFiles || run.leftovers.length || run.error) {
-      differences.push(`${run.settings.buildLabel}: the run is partial, failed, canceled, or has pending cleanup.`)
+      differences.push(`${reportLabel(run)}: the run is partial, failed, canceled, or has pending cleanup.`)
     }
   }
-  for (const key of ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed', 'architecture', 'notes'] as const) {
+  for (const key of ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed'] as const) {
     difference(key, left.settings[key], right.settings[key])
   }
   for (const key of ['model', 'manufacturer', 'maxPayloadSize'] as const) {
@@ -390,7 +398,6 @@ export function compareSummaries(left: RunSummary, right: RunSummary): Compariso
   for (const name of dependencyNames) {
     difference(`${name} version`, left.environment.dependencies[name] ?? '', right.environment.dependencies[name] ?? '')
   }
-  if (left.settings.buildLabel === right.settings.buildLabel) warnings.push('Both reports have the same manual build label.')
   if (left.environment.siteCommit === 'local-development' || right.environment.siteCommit === 'local-development') {
     warnings.push('The local-development build has no immutable commit identity; independently confirm identical site code.')
   }
@@ -422,14 +429,14 @@ const csvHeader = ['row_type', 'run_id', 'build_label', 'architecture', 'device_
   'schema_version', 'seed', 'pattern', 'files_per_round', 'file_size_bytes', 'rounds', 'browser',
   'site_version', 'site_commit', 'device_manufacturer', 'adb_max_payload_bytes', 'adb_features',
   'adb_version', 'webusb_version', 'stream_extra_version', 'started_at_utc', 'completed_at_utc',
-  'performance_time_origin_ms', 'diagnostics_enabled']
+  'performance_time_origin_ms', 'tags', 'diagnostics_enabled']
 
 function csvLine(values: Array<string | number | boolean>): string {
   return `${values.map(csvCell).join(',')}\r\n`
 }
 
 function csvPrefix(run: RunSummary, kind: string): Array<string | number> {
-  return [kind, run.id, run.settings.buildLabel, run.settings.architecture, run.device.model, run.settings.notes, run.status]
+  return [kind, run.id, run.settings.buildLabel ?? '', run.settings.architecture ?? '', run.device.model, run.settings.notes, run.status]
 }
 
 function csvMetadata(run: RunSummary): Array<string | number> {
@@ -437,7 +444,7 @@ function csvMetadata(run: RunSummary): Array<string | number> {
     run.settings.rounds, run.environment.browser, run.environment.siteVersion, run.environment.siteCommit,
     run.device.manufacturer, run.device.maxPayloadSize, run.device.features.join(';'),
     ...dependencyNames.map((name) => run.environment.dependencies[name] ?? ''),
-    run.startedAt, run.completedAt, run.timeOrigin, run.environment.diagnosticsEnabled ? 'true' : 'false']
+    run.startedAt, run.completedAt, run.timeOrigin, run.settings.tags ?? '', run.environment.diagnosticsEnabled ? 'true' : 'false']
 }
 
 function speed(bytes: number, milliseconds: number): number | string {

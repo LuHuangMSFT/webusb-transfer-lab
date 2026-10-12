@@ -6,7 +6,7 @@ describe('workload validation and deterministic synthetic data', () => {
   it('uses the approved defaults and exact limits', () => {
     expect(DEFAULT_SETTINGS).toEqual({
       fileCount: 10, fileSizeBytes: 1024 ** 2, rounds: 3, pattern: 'round-trip',
-      seed: 'webusb-lab', buildLabel: 'baseline', architecture: 'arm64', notes: '',
+      seed: 'webusb-lab', tags: '', notes: '',
     })
     expect(LIMITS).toEqual({ maxFiles: 100, maxFileBytes: 16 * 1024 ** 2, maxRoundBytes: 1024 ** 3 })
     expect(validateSettings({ ...DEFAULT_SETTINGS, fileCount: 100 })).toBeTruthy()
@@ -32,9 +32,24 @@ describe('workload validation and deterministic synthetic data', () => {
     for (const overrides of [
       { seed: '' }, { seed: '  ' }, { seed: 'a'.repeat(257) },
       { buildLabel: '' }, { buildLabel: 'a'.repeat(129) }, { notes: 'a'.repeat(4097) },
+      { tags: 'a'.repeat(513) }, { tags: 'bad\u0000tag' }, { tags: null },
       { pattern: 'echo' }, { architecture: 'guessed' }, { seed: null },
     ]) {
       expect(() => validateSettings({ ...DEFAULT_SETTINGS, ...overrides } as typeof DEFAULT_SETTINGS)).toThrow()
+    }
+  })
+
+  it('accepts blank or omitted tags and preserves freeform text without interpreting it', () => {
+    expect(validateSettings(DEFAULT_SETTINGS).tags).toBe('')
+    const settings = { ...DEFAULT_SETTINGS }
+    delete settings.tags
+    expect(validateSettings(settings).tags).toBeUndefined()
+    for (const tags of ['  ', 'morning run, cable A', ' =SUM(1,2), "trial" ', '試験, تجربة']) {
+      const tagged = validateSettings({ ...settings, tags })
+      expect(tagged.tags).toBe(tags)
+      expect(tagged).not.toHaveProperty('buildLabel')
+      expect(tagged).not.toHaveProperty('architecture')
+      expect(estimateWorkload(tagged)).toEqual(estimateWorkload(settings))
     }
   })
 

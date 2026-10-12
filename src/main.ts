@@ -4,7 +4,7 @@ import { createPayloadService } from './payload'
 import { runWorkload } from './runner'
 import { DEFAULT_SETTINGS, estimateWorkload, LIMITS, validateSettings } from './workload'
 import {
-  aggregateResults, compareSummaries, MAX_IMPORT_BYTES, parseReportJson, ReportStore,
+  aggregateResults, compareSummaries, MAX_IMPORT_BYTES, parseReportJson, reportLabel, ReportStore,
 } from './results'
 import type { RunStatistics } from './results'
 import type { Environment, FileResult, PayloadService, Progress, RunSummary, Settings } from './types'
@@ -116,7 +116,7 @@ app.innerHTML = `
         <div class="section-heading"><div><p class="eyebrow">02 / CONFIGURE</p><h2 id="workload-title">Make it repeatable.</h2></div><span class="subtle">Sequential transfers</span></div>
         <form id="workload-form" novalidate>
           <fieldset id="settings-fields">
-            <legend class="sr-only">Transfer workload and manual build identity</legend>
+            <legend class="sr-only">Transfer workload and optional run tags</legend>
             <div class="preset-row" aria-label="Workload presets"><span>Quick starts</span>
               <button id="preset-default" class="chip" type="button">Default</button>
               <button id="preset-small" class="chip" type="button">Small files</button>
@@ -128,17 +128,15 @@ app.innerHTML = `
               <div class="field"><label for="file-size">File size</label><input id="file-size" type="number" min="1" step="1" required aria-describedby="workload-limits"></div>
               <div class="field"><label for="size-unit">Size unit</label><select id="size-unit"><option value="1">Bytes</option><option value="1024">KiB (1,024 bytes)</option><option value="1048576" selected>MiB (1,048,576 bytes)</option></select></div>
               <div class="field full"><label for="pattern">Transfer pattern</label><select id="pattern"><option value="round-trip">Per-file round trip — write, read, verify, delete</option><option value="batch">Batch — upload all, then read, verify & delete each</option></select></div>
-              <div class="field full"><label for="seed">Reproducible seed</label><input id="seed" type="text" maxlength="128" required spellcheck="false" autocomplete="off" aria-describedby="seed-hint"><small id="seed-hint">Keep the same seed and settings for baseline / with-fix runs.</small></div>
+              <div class="field full"><label for="seed">Reproducible seed</label><input id="seed" type="text" maxlength="128" required spellcheck="false" autocomplete="off" aria-describedby="seed-hint"><small id="seed-hint">Keep the same seed and workload settings when comparing runs.</small></div>
             </div>
             <p id="workload-limits" class="hint">Limits: 100 files · 16 MiB per file · 1 GiB of unique payload per round. Byte sizes must be positive whole numbers.</p>
             <div class="form-divider"></div>
-            <h3>Identify the build yourself</h3>
-            <p id="build-hint" class="hint">Baseline and fixed installers can report the <strong>same Chromium version</strong>. We never infer fix status or architecture from it.</p>
+            <h3>Label your results <span class="optional">optional</span></h3>
+            <p id="tags-hint" class="hint">Tags and notes are just for your records. They do not change transfers or determine whether reports can be compared. Leave them blank if you don't need them.</p>
             <div class="form-grid">
-              <div class="field"><label for="build-label">Build label <span class="required">required</span></label><select id="build-label" required aria-describedby="build-hint"><option value="">Choose a build…</option><option value="baseline">Baseline</option><option value="with-fix">With fix</option><option value="custom">Custom label</option></select></div>
-              <div class="field"><label for="architecture">Browser architecture <span class="required">required</span></label><select id="architecture" required><option value="">Choose architecture…</option><option value="arm64">ARM64</option><option value="x64">x64</option><option value="other">Other</option></select></div>
-              <div id="custom-label-field" class="field full" hidden><label for="custom-label">Custom build label</label><input id="custom-label" type="text" maxlength="120" autocomplete="off"></div>
-              <div class="field full"><label for="notes">Hardware / run notes <span class="optional">optional</span></label><textarea id="notes" rows="2" maxlength="2000" placeholder="Same phone, USB port, cable, driver, power / thermal state…" aria-describedby="notes-hint"></textarea><small id="notes-hint">Notes must match for a compatible comparison. They stay local unless you export. Do not include secrets or identifying information.</small></div>
+              <div class="field full"><label for="tags">Tags <span class="optional">optional</span></label><input id="tags" type="text" maxlength="512" autocomplete="off" placeholder="e.g. morning run, cable A, trial 2" aria-describedby="tags-hint"><small>Freeform text, up to 512 characters. Use commas to separate tags if you like.</small></div>
+              <div class="field full"><label for="notes">Run notes <span class="optional">optional</span></label><textarea id="notes" rows="2" maxlength="2000" placeholder="Anything you want to remember about this run…" aria-describedby="notes-hint"></textarea><small id="notes-hint">Tags and notes stay in this browser and are included in JSON/CSV exports, not diagnostic logs. Do not include secrets or identifying information.</small></div>
             </div>
           </fieldset>
           <div id="settings-error" class="form-message" role="status"></div>
@@ -147,20 +145,20 @@ app.innerHTML = `
           </dl>
           <p class="hint">Traffic counts both directions across all rounds, excluding ADB overhead. Phone storage requires additional safety headroom.</p>
           <div class="run-actions"><button id="start" type="submit" class="primary" disabled>Start verified run</button><button id="stop" type="button" class="danger-outline" disabled>Stop run</button></div>
-          <p id="start-hint" class="hint">Connect a phone and choose a build label and architecture to start.</p>
+          <p id="start-hint" class="hint">Connect a phone to start. Tags and notes are optional.</p>
         </form>
       </section>
 
       <aside class="lab-notes" aria-label="Measurement guide">
-        <section class="panel note-panel"><p class="eyebrow">A MEASUREMENT, NOT A GUESS</p><h2>Same bytes.<br>Two browser builds.</h2>
-          <ol class="comparison-steps"><li><span>01</span><div><strong>Run the baseline</strong><p>Label the build, keep your settings, and save the report.</p></div></li><li><span>02</span><div><strong>Switch to the fixed build</strong><p>Use the same site commit, phone, cable, port, workload, and seed.</p></div></li><li><span>03</span><div><strong>Compare, then investigate</strong><p>Import both reports below. Repeat trials and use traces to explain a difference.</p></div></li></ol>
+        <section class="panel note-panel"><p class="eyebrow">A MEASUREMENT, NOT A GUESS</p><h2>Same bytes.<br>Repeatable runs.</h2>
+          <ol class="comparison-steps"><li><span>01</span><div><strong>Save a reference run</strong><p>Choose your workload, optionally add tags, and save the report.</p></div></li><li><span>02</span><div><strong>Repeat under controlled conditions</strong><p>Keep the workload and seed fixed. Record anything you intentionally change in your tags or notes.</p></div></li><li><span>03</span><div><strong>Compare, then investigate</strong><p>Import both reports below. Repeat trials and use traces to explain a difference.</p></div></li></ol>
         </section>
         <section class="panel note-panel quiet"><h3>What the clock includes</h3>
           <p>Upload and download timers span the complete device-storage operation, including its safety checks, ownership bookkeeping, and SYNC write completion or read through successful EOF.</p>
           <p>These are <strong>application end-to-end times</strong>, including ADB, filesystem behavior, copies, and browser scheduling—not bare SYNC-call durations or pure WinUSB latency.</p>
           <p>Byte totals count known completed transfers. Failed streams may move uncounted partial bytes while still contributing elapsed time; partial-run throughput is not a complete measurement.</p>
           <p>Setup, payload generation / expected SHA-256, readback SHA-256 / size checks, and cleanup are timed separately. Successful readback is <strong>not proof of durable flash writes</strong>; caches and thermal state still matter.</p>
-          <details><summary>External profiling checklist</summary><ol><li>Start WPR and/or a browser performance recording manually.</li><li>Run a manually labeled, reproducible workload.</li><li>Stop the recording and save it with this report and matching browser symbols.</li><li>Use Windows stacks and USB traces to attribute timing differences. This site cannot start WPR or collect privileged profiles.</li></ol></details>
+          <details><summary>External profiling checklist</summary><ol><li>Start WPR and/or a browser performance recording manually.</li><li>Run a reproducible workload.</li><li>Stop the recording and save it with this report and matching browser symbols.</li><li>Use Windows stacks and USB traces to attribute timing differences. This site cannot start WPR or collect privileged profiles.</li></ol></details>
         </section>
       </aside>
     </div>
@@ -187,11 +185,11 @@ app.innerHTML = `
     <section id="reports" class="panel" aria-labelledby="reports-title">
       <div class="section-heading"><div><p class="eyebrow">04 / REVIEW</p><h2 id="reports-title" tabindex="-1">Keep the evidence.</h2></div><span class="badge">On this browser only</span></div>
       <p>Reports are saved in IndexedDB, one file record at a time. Nothing is sent to a server. Export before clearing browser data; storage can be evicted by the browser.</p>
-      <p class="hint">Exports contain build / browser / device-model metadata and your notes, not private keys, payload contents, or device serial numbers. JSON retains full evidence; CSV includes file, round, and run rows.</p>
+      <p class="hint">Exports contain browser / device-model metadata and your optional tags and notes, not private keys, payload contents, or device serial numbers. JSON retains full evidence; CSV includes file, round, and run rows.</p>
       <div id="report-error" class="notice error" role="alert" hidden></div>
       <p id="report-status" role="status" class="hint">Opening local report storage…</p>
       <div class="table-scroll" tabindex="0" role="region" aria-label="Saved reports, scroll horizontally if needed">
-        <table><caption>20 most recent local reports</caption><thead><tr><th scope="col">Build / started</th><th scope="col">Workload</th><th scope="col">Status</th><th scope="col">Verified</th><th scope="col">Actions</th></tr></thead><tbody id="saved-reports"><tr><td colspan="5" class="empty-state">No local reports yet.</td></tr></tbody></table>
+        <table><caption>20 most recent local reports</caption><thead><tr><th scope="col">Tags / started</th><th scope="col">Workload</th><th scope="col">Status</th><th scope="col">Verified</th><th scope="col">Actions</th></tr></thead><tbody id="saved-reports"><tr><td colspan="5" class="empty-state">No local reports yet.</td></tr></tbody></table>
       </div>
       <div class="comparison-section">
         <div class="section-heading"><div><h3>Compare two reports</h3><p class="hint">B relative to A. Only matched, complete runs produce a delta. No statistical-significance claims.</p></div></div>
@@ -221,9 +219,7 @@ const sizeUnit = element<HTMLSelectElement>('size-unit')
 const rounds = element<HTMLInputElement>('rounds')
 const pattern = element<HTMLSelectElement>('pattern')
 const seed = element<HTMLInputElement>('seed')
-const buildLabel = element<HTMLSelectElement>('build-label')
-const customLabel = element<HTMLInputElement>('custom-label')
-const architecture = element<HTMLSelectElement>('architecture')
+const tags = element<HTMLInputElement>('tags')
 const notes = element<HTMLTextAreaElement>('notes')
 const connectButton = element<HTMLButtonElement>('connect')
 const disconnectButton = element<HTMLButtonElement>('disconnect')
@@ -348,39 +344,26 @@ function refreshLeftovers(): void {
 }
 
 function readSettings(): Settings {
-  if (!buildLabel.value) throw new Error('Choose a manual build label. Browser versions do not identify the fix.')
-  if (!architecture.value) throw new Error('Choose the architecture of the browser build you launched.')
-  const selectedArchitecture = architecture.value
-  if (selectedArchitecture !== 'arm64' && selectedArchitecture !== 'x64' && selectedArchitecture !== 'other') throw new Error('Choose a supported architecture label.')
   const selectedPattern = pattern.value
   if (selectedPattern !== 'round-trip' && selectedPattern !== 'batch') throw new Error('Choose a transfer pattern.')
-  if (buildLabel.value === 'custom' && !customLabel.value.trim()) throw new Error('Enter a custom build label.')
-  if ([seed.value, customLabel.value, notes.value].some((value) => /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value))) {
-    throw new Error('Seed, build label, and notes must not contain control characters.')
-  }
   return validateSettings({
     fileCount: fileCount.valueAsNumber,
     fileSizeBytes: fileSize.valueAsNumber * Number(sizeUnit.value),
     rounds: rounds.valueAsNumber,
     pattern: selectedPattern,
     seed: seed.value,
-    buildLabel: buildLabel.value === 'custom' ? `custom: ${customLabel.value.trim()}` : buildLabel.value,
-    architecture: selectedArchitecture,
+    tags: tags.value,
     notes: notes.value,
   })
 }
 
 function updateSettings(): void {
-  element('custom-label-field').hidden = buildLabel.value !== 'custom'
-  customLabel.required = buildLabel.value === 'custom'
   fileSize.min = String(1 / Number(sizeUnit.value))
   const sizeBytes = fileSize.valueAsNumber * Number(sizeUnit.value)
   const validInteger = (value: number, max = Number.MAX_SAFE_INTEGER): boolean => Number.isSafeInteger(value) && value >= 1 && value <= max
   fileCount.setAttribute('aria-invalid', String(!validInteger(fileCount.valueAsNumber, LIMITS.maxFiles)))
   fileSize.setAttribute('aria-invalid', String(!validInteger(sizeBytes, LIMITS.maxFileBytes)))
   rounds.setAttribute('aria-invalid', String(!validInteger(rounds.valueAsNumber)))
-  buildLabel.setAttribute('aria-invalid', String(!buildLabel.value))
-  architecture.setAttribute('aria-invalid', String(!architecture.value))
   seed.setAttribute('aria-invalid', String(!seed.value.trim()))
   try {
     settings = readSettings()
@@ -391,7 +374,7 @@ function updateSettings(): void {
     element('settings-error').textContent = errorMessage(error)
     element('settings-error').className = 'form-message'
   }
-  // Estimates remain useful before the mandatory manual build identity is selected.
+  // Invalid optional metadata should not hide otherwise useful byte estimates.
   try {
     const estimate = estimateWorkload(validateSettings({
       fileCount: fileCount.valueAsNumber,
@@ -399,8 +382,7 @@ function updateSettings(): void {
       rounds: rounds.valueAsNumber,
       pattern: pattern.value === 'batch' ? 'batch' : 'round-trip',
       seed: seed.value,
-      buildLabel: 'estimate only',
-      architecture: 'other',
+      tags: '',
       notes: '',
     }))
     element('estimate-round').textContent = bytes(estimate.roundBytes)
@@ -428,8 +410,8 @@ function updateControls(): void {
   element('start-hint').textContent = running ? (controller ? 'Settings are frozen until the transfer stops and cleanup finishes.' : 'Transfer finished. Finalizing the local report and timing statistics…')
     : !supported ? 'A secure, native desktop Chromium browser with WebUSB is required.'
       : !storageReady ? 'Local report storage must be available before a run can start.'
-        : !client.connected ? 'Connect a phone, then start your manually labeled workload.'
-          : !settings ? 'Complete the workload and required build identity above.'
+        : !client.connected ? 'Connect a phone to start. Tags and notes are optional.'
+          : !settings ? 'Review the workload settings above.'
             : reportsBusy ? 'Wait for the local report operation to finish before measuring.'
               : 'Ready. Stop ends scheduling immediately; a disconnected session may require reconnecting for cleanup.'
   for (const control of document.querySelectorAll<HTMLButtonElement | HTMLSelectElement | HTMLInputElement>(
@@ -747,7 +729,7 @@ async function refreshReports(): Promise<void> {
     const row = body.insertRow()
     const identity = row.insertCell()
     const label = document.createElement('strong')
-    label.textContent = report.settings.buildLabel
+    label.textContent = reportLabel(report)
     const time = document.createElement('small')
     time.textContent = new Date(report.startedAt).toLocaleString()
     identity.append(label, time)
@@ -763,7 +745,7 @@ async function refreshReports(): Promise<void> {
       button.type = 'button'
       button.className = 'compact'
       button.textContent = format.toUpperCase()
-      button.setAttribute('aria-label', `Export ${format.toUpperCase()} for ${report.settings.buildLabel}, ${time.textContent}`)
+      button.setAttribute('aria-label', `Export ${format.toUpperCase()} for ${reportLabel(report)}, ${time.textContent}`)
       button.addEventListener('click', () => { void reportAction(async () => {
         const blob = await store.export(report.id, format)
         const url = URL.createObjectURL(blob)
@@ -782,7 +764,7 @@ async function refreshReports(): Promise<void> {
     remove.type = 'button'
     remove.className = 'compact text-button'
     remove.textContent = 'Delete'
-    remove.setAttribute('aria-label', `Delete local report ${report.settings.buildLabel}, ${time.textContent}`)
+    remove.setAttribute('aria-label', `Delete local report ${reportLabel(report)}, ${time.textContent}`)
     remove.addEventListener('click', () => {
       if (!window.confirm('Delete this local report and all of its measurement records? This does not delete phone cleanup records.')) return
       void reportAction(async () => {
@@ -801,7 +783,7 @@ async function refreshReports(): Promise<void> {
     const previous = select.value
     select.replaceChildren(new Option('Choose a saved run…', ''))
     for (const report of localReports) select.add(new Option(
-      `${report.settings.buildLabel} · ${new Date(report.startedAt).toLocaleString()} · ${report.status}`,
+      `${reportLabel(report)} · ${new Date(report.startedAt).toLocaleString()} · ${report.status}`,
       report.id,
     ))
     select.value = previous
@@ -832,7 +814,7 @@ function renderComparison(): void {
   for (const slot of ['a', 'b'] as const) {
     const selected = slots[slot]
     element(`compare-${slot}-detail`).textContent = selected
-      ? `${selected.run.settings.buildLabel} · ${selected.run.settings.architecture} · ${selected.run.device.model} · ${selected.run.status} · ${selected.stats.passed} verified`
+      ? `${reportLabel(selected.run)} · ${selected.run.device.model} · ${selected.run.status} · ${selected.stats.passed} verified`
       : `No ${slot === 'a' ? 'reference' : 'candidate'} selected.`
   }
   const target = element('comparison-result')
@@ -886,7 +868,7 @@ function renderComparison(): void {
     if (!selected) continue
     const details = document.createElement('details')
     const summary = document.createElement('summary')
-    summary.textContent = `${slot.toUpperCase()} · ${selected.run.settings.buildLabel} · ${selected.run.status} · timing details`
+    summary.textContent = `${slot.toUpperCase()} · ${reportLabel(selected.run)} · ${selected.run.status} · timing details`
     const content = document.createElement('div')
     renderStatistics(content, selected.stats)
     details.append(summary, content)

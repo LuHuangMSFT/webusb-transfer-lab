@@ -1,5 +1,4 @@
 export type Pattern = 'round-trip' | 'batch'
-export type Architecture = 'arm64' | 'x64' | 'other'
 
 export interface Settings {
   fileCount: number
@@ -7,9 +6,11 @@ export interface Settings {
   rounds: number
   pattern: Pattern
   seed: string
-  buildLabel: string
-  architecture: Architecture
+  tags?: string
   notes: string
+  // Retained only for reading and re-exporting older reports.
+  buildLabel?: string
+  architecture?: 'arm64' | 'x64' | 'other'
 }
 
 export interface DeviceInfo {

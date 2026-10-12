@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test'
-import { readdir } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type {} from './harness'
 import type { PayloadReply } from '../src/payload'
@@ -99,3 +99,54 @@ test('diagnostic runner markers survive real IndexedDB and JSON/CSV exports', as
   expect(result.diagnostics.entries.some((entry) => entry.event === 'run.phase.end'
     && entry.context.phase === 'download' && entry.context.round === 1 && entry.context.index === 1)).toBe(true)
 })
+
+for (const tags of ['', '=SUM(1,2), cable A']) {
+  test(`UI starts and saves a ${tags ? 'tagged' : 'completely untagged'} run (simulated device)`, async ({ page }) => {
+    // Only replace the device boundary in this development-server test. The
+    // production UI, worker, runner and IndexedDB reporting still execute.
+    await page.route('**/src/adb-client.ts', (route) => route.fulfill({
+      contentType: 'text/javascript',
+      body: `
+        import { SimulatedDevice } from '/webusb-transfer-lab/tests/harness.ts';
+        export class AdbClient extends SimulatedDevice {
+          constructor() { super('success'); this.connected = false; }
+          async connect() { this.connected = true; }
+          async disconnect() { this.connected = false; }
+          getLeftovers() { return []; }
+          async cleanupLeftovers() {}
+        }
+      `,
+    }))
+    await page.goto('http://127.0.0.1:4174/webusb-transfer-lab/')
+    await page.locator('#file-count').fill('1')
+    await page.locator('#rounds').fill('1')
+    await page.locator('#size-unit').selectOption('1')
+    await page.locator('#file-size').fill('1024')
+    await page.locator('#tags').fill(tags)
+    await expect(page.locator('#notes')).toHaveValue('')
+    await expect(page.locator('#settings-error')).toHaveText('Workload is valid.')
+    await page.locator('#connect').click()
+    await expect(page.locator('#start')).toBeEnabled()
+    await page.locator('#start').click()
+    await expect(page.locator('#run-badge')).toHaveText('Completed · verified')
+    await expect(page.locator('#saved-reports')).toContainText(tags || 'Untagged run')
+    await page.reload()
+    await expect(page.locator('#saved-reports')).toContainText(tags || 'Untagged run')
+    const jsonPromise = page.waitForEvent('download')
+    await page.locator('#saved-reports button').filter({ hasText: /^JSON$/ }).click()
+    const jsonFile = await jsonPromise
+    const report = JSON.parse(await readFile((await jsonFile.path())!, 'utf8'))
+    expect(report.run.settings.tags).toBe(tags)
+    expect(report.run.settings.notes).toBe('')
+    expect(report.run.settings).not.toHaveProperty('buildLabel')
+    expect(report.run.settings).not.toHaveProperty('architecture')
+    expect(report.run.completedFiles).toBe(1)
+    expect(report.files[0].expectedSha256).toBe(report.files[0].actualSha256)
+    const csvPromise = page.waitForEvent('download')
+    await page.locator('#saved-reports button').filter({ hasText: /^CSV$/ }).click()
+    const csvFile = await csvPromise
+    const csv = await readFile((await csvFile.path())!, 'utf8')
+    expect(csv.split('\r\n')[0]).toContain('"tags"')
+    if (tags) expect(csv).toContain(`"'${tags}"`)
+  })
+}

@@ -7,7 +7,7 @@ import { diagnosticSnapshot, setDiagnosticsEnabled } from '../src/diagnostics'
 
 type Scenario = 'success' | 'corrupt' | 'cancel-commit' | 'fail-commit'
 
-class SimulatedDevice implements DeviceStorage {
+export class SimulatedDevice implements DeviceStorage {
   readonly info = { model: 'Simulated phone', manufacturer: 'Test fixture', features: ['simulated'], maxPayloadSize: 65536 }
   connected = true
   readonly files = new Map<string, Uint8Array<ArrayBuffer>>()

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   aggregateResults, compareReports, csvCell, MAX_IMPORT_BYTES, MAX_IMPORT_FILES,
-  nearestRank, parseReportJson, reportToCsv, validateReport,
+  nearestRank, parseReportJson, reportLabel, reportToCsv, validateReport,
 } from './results'
 import type { FileResult, RunReport } from './types'
 
@@ -78,6 +78,36 @@ function partial(): RunReport {
 }
 
 describe('strict, privacy-bounded report import', () => {
+  it('round trips tagged and untagged reports without fabricating legacy labels', () => {
+    for (const tags of ['', 'trial 2, cable A', '試験, تجربة']) {
+      const report = fixture()
+      delete report.run.settings.buildLabel
+      delete report.run.settings.architecture
+      report.run.settings.tags = tags
+      const parsed = parseReportJson(JSON.stringify(report))
+      expect(parsed).toEqual(report)
+      expect(parsed.run.settings).not.toHaveProperty('buildLabel')
+      expect(parsed.run.settings).not.toHaveProperty('architecture')
+      expect(reportLabel(parsed.run)).toBe(tags || `Untagged run ${report.run.id.slice(0, 8)}`)
+    }
+  })
+
+  it('keeps original metadata intact when reading older reports', () => {
+    const report = fixture()
+    expect(report.run.settings).not.toHaveProperty('tags')
+    const parsed = parseReportJson(JSON.stringify(report))
+    expect(parsed).toEqual(report)
+    expect(reportLabel(parsed.run)).toBe('baseline · arm64')
+    expect(reportToCsv(parsed)).toContain('"baseline","arm64"')
+  })
+
+  it('rejects malformed or oversized optional tags', () => {
+    for (const tags of [null, [], 12, 'x'.repeat(513), 'bad\u0000tag']) {
+      const report = fixture()
+      expect(() => validateReport({ ...report, run: { ...report.run, settings: { ...report.run.settings, tags } } })).toThrow()
+    }
+  })
+
   it('accepts legacy reports and validates optional diagnostic metadata', () => {
     expect(validateReport(fixture()).run.environment.diagnosticsEnabled).toBeUndefined()
     const report = fixture()
@@ -293,16 +323,19 @@ describe('safe flat CSV exports', () => {
     expect(lines.at(-1)).toContain('"run"')
     expect(lines[0]).toContain('"recorded_files"')
     expect(lines[0]).toContain('"diagnostics_enabled"')
-    expect(lines.every((line) => line.split(',').length === 45)).toBe(true)
+    expect(lines[0]).toContain('"tags"')
+    expect(lines.every((line) => line.split(',').length === 46)).toBe(true)
   })
 
-  it('protects user labels and notes and has no payload, serial or private-key columns', () => {
+  it('protects tags, legacy labels and notes and has no payload, serial or private-key columns', () => {
     const report = fixture()
     report.run.settings.buildLabel = '=HYPERLINK("bad")'
     report.run.settings.notes = '@formula'
+    report.run.settings.tags = '+SUM(1,2), "trial"'
     const csv = reportToCsv(report)
     expect(csv).toContain('"\'=HYPERLINK(""bad"")"')
     expect(csv).toContain('"\'@formula"')
+    expect(csv).toContain(`"'+SUM(1,2), ""trial"""`)
     expect(csv.split('\r\n')[0]).not.toMatch(/private|serial|payload_contents/iu)
   })
 
@@ -322,6 +355,20 @@ describe('conservative two-run comparison', () => {
     expect(result.downloadTimeDeltaPercent).toBe(-50)
     expect(result.wallTimeDeltaPercent).toBe(-20)
     expect(result.warnings.join(' ')).toContain('not a claim of statistical significance')
+  })
+
+  it('ignores all bookkeeping, including different legacy architecture values', () => {
+    const first = fixture()
+    const second = candidate()
+    first.run.settings.tags = 'morning run, trial 1'
+    second.run.settings.tags = 'afternoon run, trial 2'
+    second.run.settings.notes = 'different wording'
+    second.run.settings.architecture = 'x64'
+    expect(compareReports(first, second)).toMatchObject({ compatible: true, uploadTimeDeltaPercent: -50 })
+    delete first.run.settings.buildLabel
+    delete first.run.settings.architecture
+    first.run.settings.tags = ''
+    expect(compareReports(first, second).compatible).toBe(true)
   })
 
   it('accepts reordered protocol capabilities without assuming physical identity', () => {
@@ -344,11 +391,9 @@ describe('conservative two-run comparison', () => {
     expect(compareReports(fixture(), fixture()).differences).toContain('The same run was selected twice.')
   })
 
-  it('flags seed, architecture, notes, pattern, device, site, dependency and browser differences', () => {
+  it('flags seed, pattern, device, site, dependency and browser differences', () => {
     const mutations: Array<(report: RunReport) => void> = [
       (report) => { report.run.settings.seed = 'other seed' },
-      (report) => { report.run.settings.architecture = 'x64' },
-      (report) => { report.run.settings.notes = 'other cable' },
       (report) => { report.run.settings.pattern = 'batch' },
       (report) => { report.run.device.model = 'Different phone' },
       (report) => { report.run.device.manufacturer = 'Different OEM' },

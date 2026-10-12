@@ -93,7 +93,7 @@ describe('runner with simulated device storage (not hardware coverage)', () => {
   it('marks diagnostic runs and records phase, file, and completion context without user input', async () => {
     setDiagnosticsEnabled(true)
     clearDiagnostics()
-    const { options } = fixture({ fileCount: 1, rounds: 1, seed: 'private-seed', notes: 'private-notes', buildLabel: 'private-label' })
+    const { options } = fixture({ fileCount: 1, rounds: 1, seed: 'private-seed', notes: 'private-notes', tags: 'private-tags' })
     const summary = await runWorkload(options)
     expect(summary.environment.diagnosticsEnabled).toBe(true)
     const log = diagnosticSnapshot()
@@ -104,7 +104,7 @@ describe('runner with simulated device storage (not hardware coverage)', () => {
       event: 'run.file.verified', context: { runId: summary.id, round: 1, index: 1, bytes: 8 },
     }))
     expect(log.entries.at(-1)).toMatchObject({ event: 'run.end', context: { status: 'completed', files: 1 } })
-    expect(JSON.stringify(log)).not.toMatch(/private-seed|private-notes|private-label|Simulated phone/)
+    expect(JSON.stringify(log)).not.toMatch(/private-seed|private-notes|private-tags|Simulated phone/)
   })
 
   it('logs failed run phase and file context with tracing disabled', async () => {
@@ -158,6 +158,27 @@ describe('runner with simulated device storage (not hardware coverage)', () => {
     expect(summary.totals.downloadedBytes / summary.totals.downloadMs).toBe(0.4)
     expect(performance.getEntries().filter((entry) => entry.name.startsWith(summary.id))).toHaveLength(0)
     expect(vi.mocked(options.onProgress).mock.calls.length).toBeLessThanOrEqual(7)
+  })
+
+  it('runs identically with or without optional bookkeeping and freezes the saved tags', async () => {
+    const untagged = fixture({ fileCount: 1, rounds: 1 })
+    const first = await runWorkload(untagged.options)
+    const tagged = fixture({ fileCount: 1, rounds: 1, tags: 'cable A, trial 2', notes: 'For my records' })
+    const start = tagged.options.onStart
+    tagged.options.onStart = async (summary) => {
+      await start(summary)
+      tagged.options.settings.tags = 'changed after start'
+    }
+    const second = await runWorkload(tagged.options)
+    expect(first.status).toBe('completed')
+    expect(second.status).toBe('completed')
+    expect(first.settings.tags).toBe('')
+    expect(second.settings.tags).toBe('cable A, trial 2')
+    expect(second.settings).not.toHaveProperty('buildLabel')
+    expect(second.settings).not.toHaveProperty('architecture')
+    expect(second.totals).toEqual(first.totals)
+    expect(tagged.device.events).toEqual(untagged.device.events)
+    expect(tagged.records[0].expectedSha256).toBe(untagged.records[0].expectedSha256)
   })
 
   it('retains summed timing counters for weighted, not averaged, throughput', async () => {

@@ -52,6 +52,10 @@ test('production page boots with local assets, defaults and no automatic device 
   await expect(page.locator('#file-count')).toHaveValue('10')
   await expect(page.locator('#file-size')).toHaveValue('1')
   await expect(page.locator('#rounds')).toHaveValue('3')
+  await expect(page.locator('#tags')).toHaveValue('')
+  await expect(page.locator('#tags')).not.toHaveAttribute('required')
+  await expect(page.locator('#build-label, #architecture, #custom-label')).toHaveCount(0)
+  await expect(page.locator('#settings-error')).toHaveText('Workload is valid.')
   await expect(page.locator('#estimate-traffic')).toHaveText('60 MiB')
   await expect(page.locator('#start')).toBeDisabled()
   await expect(page.locator('#connection-badge')).toHaveText('Disconnected')
@@ -62,8 +66,6 @@ test('production page boots with local assets, defaults and no automatic device 
 
 test('all file and aggregate bounds are visible before connection', async ({ page }) => {
   await page.goto('./')
-  await page.locator('#build-label').selectOption('baseline')
-  await page.locator('#architecture').selectOption('arm64')
   await page.locator('#file-size').fill('16')
   await page.locator('#file-count').fill('64')
   await expect(page.locator('#settings-error')).toHaveText('Workload is valid.')
@@ -120,6 +122,51 @@ test('simulated JSON reports produce a matched comparison without a USB device',
   await page.locator('#import-b').setInputFiles({ name: 'fixed.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(simulatedReport(true))) })
   await expect(page.locator('#comparison-result')).toContainText(/50/)
   await expect(page.locator('#comparison-result')).not.toContainText('not comparable')
+})
+
+test('tags are displayed as text and differing bookkeeping does not block comparisons', async ({ page }) => {
+  await page.goto('./')
+  const first = simulatedReport()
+  const second = simulatedReport(true)
+  delete first.run.settings.buildLabel
+  delete first.run.settings.architecture
+  first.run.settings.tags = '<img src=x onerror=alert(1)>, cable A'
+  second.run.settings.tags = 'trial 2'
+  second.run.settings.notes = 'Different freeform note'
+  second.run.settings.architecture = 'x64'
+  await page.locator('#import-a').setInputFiles({ name: 'a.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(first)) })
+  await page.locator('#import-b').setInputFiles({ name: 'b.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(second)) })
+  await expect(page.locator('#compare-a-detail')).toContainText(first.run.settings.tags)
+  await expect(page.locator('#compare-a-detail img')).toHaveCount(0)
+  await expect(page.locator('#comparison-result')).toContainText('Recorded settings match')
+  await expect(page.locator('#comparison-result')).toContainText('50')
+})
+
+test('legacy saved reports remain readable and export their original labels', async ({ page }) => {
+  await page.goto('./')
+  await expect(page.locator('#report-status')).not.toHaveText('Opening local report storage…')
+  const report = simulatedReport()
+  await page.evaluate(async (report) => {
+    await new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open('webusb-transfer-lab', 1)
+      open.onerror = () => reject(open.error)
+      open.onsuccess = () => {
+        const db = open.result
+        const transaction = db.transaction(['runs', 'files'], 'readwrite')
+        transaction.objectStore('runs').add(report.run)
+        for (const file of report.files) transaction.objectStore('files').add(file)
+        transaction.oncomplete = () => { db.close(); resolve() }
+        transaction.onabort = () => { db.close(); reject(transaction.error) }
+      }
+    })
+  }, report)
+  await page.reload()
+  await expect(page.locator('#saved-reports')).toContainText('baseline · arm64')
+  const downloaded = page.waitForEvent('download')
+  await page.locator('#saved-reports button').filter({ hasText: /^JSON$/ }).click()
+  const download = await downloaded
+  const exported = JSON.parse(await readFile((await download.path())!, 'utf8'))
+  expect(exported).toEqual(report)
 })
 
 test('malformed and incompatible imports fail explicitly', async ({ page }) => {

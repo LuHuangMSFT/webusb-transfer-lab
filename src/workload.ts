@@ -12,8 +12,7 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze({
   rounds: 3,
   pattern: 'round-trip',
   seed: 'webusb-lab',
-  buildLabel: 'baseline',
-  architecture: 'arm64',
+  tags: '',
   notes: '',
 })
 
@@ -26,6 +25,9 @@ function positiveInteger(value: number, name: string, maximum = Number.MAX_SAFE_
 function boundedText(value: string, name: string, maximum: number, required: boolean): void {
   if (typeof value !== 'string' || value.length > maximum || (required && !value.trim())) {
     throw new Error(`${name} must ${required ? 'be nonempty and ' : ''}contain at most ${maximum} characters.`)
+  }
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${name} must not contain control characters.`)
   }
 }
 
@@ -45,11 +47,12 @@ export function validateSettings(settings: Settings): Settings {
   if (settings.pattern !== 'round-trip' && settings.pattern !== 'batch') {
     throw new Error('Transfer pattern must be round-trip or batch.')
   }
-  if (!['arm64', 'x64', 'other'].includes(settings.architecture)) {
+  if (settings.architecture !== undefined && !['arm64', 'x64', 'other'].includes(settings.architecture)) {
     throw new Error('Architecture must be arm64, x64, or other.')
   }
   boundedText(settings.seed, 'Seed', 256, true)
-  boundedText(settings.buildLabel, 'Build label', 128, true)
+  if (settings.tags !== undefined) boundedText(settings.tags, 'Tags', 512, false)
+  if (settings.buildLabel !== undefined) boundedText(settings.buildLabel, 'Build label', 128, true)
   boundedText(settings.notes, 'Notes', 4096, false)
   return Object.freeze({
     fileCount: settings.fileCount,
@@ -57,8 +60,9 @@ export function validateSettings(settings: Settings): Settings {
     rounds: settings.rounds,
     pattern: settings.pattern,
     seed: settings.seed,
-    buildLabel: settings.buildLabel,
-    architecture: settings.architecture,
+    ...(settings.tags === undefined ? {} : { tags: settings.tags }),
+    ...(settings.buildLabel === undefined ? {} : { buildLabel: settings.buildLabel }),
+    ...(settings.architecture === undefined ? {} : { architecture: settings.architecture }),
     notes: settings.notes,
   })
 }
