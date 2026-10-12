@@ -4,6 +4,8 @@ export const LIMITS = Object.freeze({
   maxFiles: 100,
   maxFileBytes: 1024 ** 3,
   maxRoundBytes: 1024 ** 3,
+  maxPreparedBytes: 1024 ** 3,
+  maxPreparedFiles: 20_000,
 })
 
 export const DEFAULT_SETTINGS: Settings = Object.freeze({
@@ -12,6 +14,8 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze({
   rounds: 3,
   pattern: 'round-trip',
   seed: 'webusb-lab',
+  preGenerate: false,
+  reuseAcrossRounds: false,
   tags: '',
   notes: '',
 })
@@ -44,6 +48,18 @@ export function validateSettings(settings: Settings): Settings {
   if (!Number.isSafeInteger(totalFiles) || !Number.isSafeInteger(totalTrafficBytes)) {
     throw new Error('Aggregate file count and bidirectional traffic must be safe integers.')
   }
+  for (const key of ['preGenerate', 'reuseAcrossRounds'] as const) {
+    if (settings[key] !== undefined && typeof settings[key] !== 'boolean') {
+      throw new Error(`${key} must be a boolean.`)
+    }
+  }
+  if (settings.preGenerate && settings.fileCount * settings.fileSizeBytes *
+      (settings.reuseAcrossRounds ? 1 : settings.rounds) > LIMITS.maxPreparedBytes) {
+    throw new Error('Pre-generated payloads cannot exceed 1 GiB total. Reuse files across rounds or reduce the workload.')
+  }
+  if (settings.preGenerate && settings.fileCount * (settings.reuseAcrossRounds ? 1 : settings.rounds) > LIMITS.maxPreparedFiles) {
+    throw new Error('Pre-generation cannot exceed 20,000 files. Reuse files across rounds or reduce the workload.')
+  }
   if (settings.pattern !== 'round-trip' && settings.pattern !== 'batch') {
     throw new Error('Transfer pattern must be round-trip or batch.')
   }
@@ -60,11 +76,20 @@ export function validateSettings(settings: Settings): Settings {
     rounds: settings.rounds,
     pattern: settings.pattern,
     seed: settings.seed,
+    ...(settings.preGenerate === undefined ? {} : { preGenerate: settings.preGenerate }),
+    ...(settings.reuseAcrossRounds === undefined ? {} : { reuseAcrossRounds: settings.reuseAcrossRounds }),
     ...(settings.tags === undefined ? {} : { tags: settings.tags }),
     ...(settings.buildLabel === undefined ? {} : { buildLabel: settings.buildLabel }),
     ...(settings.architecture === undefined ? {} : { architecture: settings.architecture }),
     notes: settings.notes,
   })
+}
+
+export function retainedPayloadBytes(settings: Settings): number {
+  const validated = validateSettings(settings)
+  return validated.preGenerate
+    ? validated.fileCount * validated.fileSizeBytes * (validated.reuseAcrossRounds ? 1 : validated.rounds)
+    : validated.reuseAcrossRounds ? validated.fileCount * validated.fileSizeBytes : 0
 }
 
 export function estimateWorkload(settings: Settings): {

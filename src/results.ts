@@ -41,6 +41,11 @@ function number(value: unknown, label: string, integer = false): number {
   return value
 }
 
+function boolean(value: unknown, label: string): boolean {
+  if (typeof value !== 'boolean') invalid(`${label} must be a boolean.`)
+  return value
+}
+
 function timestamp(value: unknown, label: string): string {
   const result = text(value, label, 32)
   if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/u.test(result) ||
@@ -62,7 +67,8 @@ function strings(value: unknown, label: string, limit: number, maxLength = 256):
 
 function parseSettings(value: unknown): Settings {
   const source = object(value, 'settings')
-  fields(source, ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed', 'notes'], ['tags', 'buildLabel', 'architecture'])
+  fields(source, ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed', 'notes'],
+    ['tags', 'buildLabel', 'architecture', 'preGenerate', 'reuseAcrossRounds'])
   const pattern = source.pattern
   const architecture = source.architecture
   if (pattern !== 'round-trip' && pattern !== 'batch') invalid('unknown transfer pattern.')
@@ -73,6 +79,8 @@ function parseSettings(value: unknown): Settings {
     rounds: number(source.rounds, 'rounds', true),
     pattern,
     seed: text(source.seed, 'seed', 256),
+    ...(Object.hasOwn(source, 'preGenerate') ? { preGenerate: boolean(source.preGenerate, 'preGenerate') } : {}),
+    ...(Object.hasOwn(source, 'reuseAcrossRounds') ? { reuseAcrossRounds: boolean(source.reuseAcrossRounds, 'reuseAcrossRounds') } : {}),
     ...(source.tags === undefined ? {} : { tags: text(source.tags, 'tags', 512, true) }),
     ...(source.buildLabel === undefined ? {} : { buildLabel: text(source.buildLabel, 'build label', 128) }),
     ...(architecture === undefined ? {} : { architecture }),
@@ -364,11 +372,11 @@ export function reportLabel(run: RunSummary): string {
 
 export function compareSummaries(left: RunSummary, right: RunSummary): Comparison {
   const differences: string[] = []
-  const display = (value: string | number): string => {
+  const display = (value: string | number | boolean): string => {
     const result = JSON.stringify(value)
     return result.length > 180 ? `${result.slice(0, 177)}…` : result
   }
-  const difference = (label: string, before: string | number, after: string | number): void => {
+  const difference = (label: string, before: string | number | boolean, after: string | number | boolean): void => {
     if (before !== after) differences.push(`Different ${label}: A = ${display(before)}; B = ${display(after)}.`)
   }
   const warnings = [
@@ -387,6 +395,9 @@ export function compareSummaries(left: RunSummary, right: RunSummary): Compariso
   }
   for (const key of ['fileCount', 'fileSizeBytes', 'rounds', 'pattern', 'seed'] as const) {
     difference(key, left.settings[key], right.settings[key])
+  }
+  for (const key of ['preGenerate', 'reuseAcrossRounds'] as const) {
+    difference(key, left.settings[key] ?? false, right.settings[key] ?? false)
   }
   for (const key of ['model', 'manufacturer', 'maxPayloadSize'] as const) {
     difference(`device ${key}`, left.device[key], right.device[key])
@@ -429,7 +440,7 @@ const csvHeader = ['row_type', 'run_id', 'build_label', 'architecture', 'device_
   'schema_version', 'seed', 'pattern', 'files_per_round', 'file_size_bytes', 'rounds', 'browser',
   'site_version', 'site_commit', 'device_manufacturer', 'adb_max_payload_bytes', 'adb_features',
   'adb_version', 'webusb_version', 'stream_extra_version', 'started_at_utc', 'completed_at_utc',
-  'performance_time_origin_ms', 'tags', 'diagnostics_enabled']
+  'performance_time_origin_ms', 'tags', 'pre_generate', 'reuse_across_rounds', 'diagnostics_enabled']
 
 function csvLine(values: Array<string | number | boolean>): string {
   return `${values.map(csvCell).join(',')}\r\n`
@@ -439,12 +450,13 @@ function csvPrefix(run: RunSummary, kind: string): Array<string | number> {
   return [kind, run.id, run.settings.buildLabel ?? '', run.settings.architecture ?? '', run.device.model, run.settings.notes, run.status]
 }
 
-function csvMetadata(run: RunSummary): Array<string | number> {
+function csvMetadata(run: RunSummary): Array<string | number | boolean> {
   return [run.schemaVersion, run.settings.seed, run.settings.pattern, run.settings.fileCount, run.settings.fileSizeBytes,
     run.settings.rounds, run.environment.browser, run.environment.siteVersion, run.environment.siteCommit,
     run.device.manufacturer, run.device.maxPayloadSize, run.device.features.join(';'),
     ...dependencyNames.map((name) => run.environment.dependencies[name] ?? ''),
-    run.startedAt, run.completedAt, run.timeOrigin, run.settings.tags ?? '', run.environment.diagnosticsEnabled ? 'true' : 'false']
+    run.startedAt, run.completedAt, run.timeOrigin, run.settings.tags ?? '',
+    run.settings.preGenerate ?? false, run.settings.reuseAcrossRounds ?? false, run.environment.diagnosticsEnabled ? 'true' : 'false']
 }
 
 function speed(bytes: number, milliseconds: number): number | string {

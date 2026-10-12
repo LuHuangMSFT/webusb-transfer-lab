@@ -1,14 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import { createInProcessPayloadService } from './payload'
-import { DEFAULT_SETTINGS, estimateWorkload, generatePayloadBytes, hashPayload, LIMITS, validateSettings } from './workload'
+import { DEFAULT_SETTINGS, estimateWorkload, generatePayloadBytes, hashPayload, LIMITS, retainedPayloadBytes, validateSettings } from './workload'
 
 describe('workload validation and deterministic synthetic data', () => {
   it('uses the approved defaults and exact limits', () => {
     expect(DEFAULT_SETTINGS).toEqual({
       fileCount: 10, fileSizeBytes: 1024 ** 2, rounds: 3, pattern: 'round-trip',
-      seed: 'webusb-lab', tags: '', notes: '',
+      seed: 'webusb-lab', tags: '', notes: '', preGenerate: false, reuseAcrossRounds: false,
     })
-    expect(LIMITS).toEqual({ maxFiles: 100, maxFileBytes: 1024 ** 3, maxRoundBytes: 1024 ** 3 })
+    expect(LIMITS).toEqual({ maxFiles: 100, maxFileBytes: 1024 ** 3, maxRoundBytes: 1024 ** 3,
+      maxPreparedBytes: 1024 ** 3, maxPreparedFiles: 20_000 })
     expect(validateSettings({ ...DEFAULT_SETTINGS, fileCount: 100 })).toBeTruthy()
     expect(validateSettings({ ...DEFAULT_SETTINGS, fileCount: 64, fileSizeBytes: 16 * 1024 ** 2 })).toBeTruthy()
     expect(() => validateSettings({ ...DEFAULT_SETTINGS, fileCount: 65, fileSizeBytes: 16 * 1024 ** 2 })).toThrow('1 GiB')
@@ -37,6 +38,31 @@ describe('workload validation and deterministic synthetic data', () => {
     const settings = { ...DEFAULT_SETTINGS, fileCount: 1, fileSizeBytes: 1, rounds: Math.floor(Number.MAX_SAFE_INTEGER / 2) }
     expect(estimateWorkload(settings).totalFiles).toBe(settings.rounds)
     expect(() => estimateWorkload({ ...settings, rounds: settings.rounds + 1 })).toThrow('safe integers')
+  })
+
+  it('limits retained preparation across all rounds unless reuse is enabled', () => {
+    const settings = { ...DEFAULT_SETTINGS, fileCount: 1, fileSizeBytes: 1024 ** 3, rounds: 2 }
+    expect(retainedPayloadBytes(settings)).toBe(0)
+    expect(retainedPayloadBytes({ ...settings, reuseAcrossRounds: true })).toBe(1024 ** 3)
+    expect(() => validateSettings({ ...settings, preGenerate: true })).toThrow('Pre-generated payloads')
+    expect(retainedPayloadBytes({ ...settings, preGenerate: true, reuseAcrossRounds: true })).toBe(1024 ** 3)
+    expect(retainedPayloadBytes({ ...settings, fileSizeBytes: 512 * 1024 ** 2, preGenerate: true })).toBe(1024 ** 3)
+    const tiny = { ...settings, fileSizeBytes: 1, rounds: 20_001, preGenerate: true }
+    expect(() => validateSettings(tiny)).toThrow('20,000 files')
+    expect(validateSettings({ ...tiny, rounds: 20_000 })).toBeTruthy()
+    expect(validateSettings({ ...tiny, reuseAcrossRounds: true })).toBeTruthy()
+  })
+
+  it('validates optional mode booleans while preserving legacy omission', () => {
+    const legacy = { ...DEFAULT_SETTINGS }
+    delete legacy.preGenerate
+    delete legacy.reuseAcrossRounds
+    expect(validateSettings(legacy)).toEqual(legacy)
+    for (const key of ['preGenerate', 'reuseAcrossRounds']) {
+      for (const value of [null, 'true', 1, [], {}]) {
+        expect(() => validateSettings({ ...DEFAULT_SETTINGS, [key]: value })).toThrow('boolean')
+      }
+    }
   })
 
   it('bounds text and rejects unsupported settings', () => {

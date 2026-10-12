@@ -1,3 +1,5 @@
+import type { PreparedFiles } from './prepared-files'
+
 export type Pattern = 'round-trip' | 'batch'
 
 export interface Settings {
@@ -6,6 +8,8 @@ export interface Settings {
   rounds: number
   pattern: Pattern
   seed: string
+  preGenerate?: boolean
+  reuseAcrossRounds?: boolean
   tags?: string
   notes: string
   // Retained only for reading and re-exporting older reports.
@@ -34,8 +38,13 @@ export interface DeviceStorage {
   abort(): void
 }
 
+export interface Payload {
+  bytes: Uint8Array<ArrayBuffer>
+  sha256: string
+}
+
 export interface PayloadService {
-  prepare(size: number, seed: string, index: number): Promise<{ bytes: Uint8Array<ArrayBuffer>; sha256: string }>
+  prepare(size: number, seed: string, index: number): Promise<Payload>
   hash(bytes: Uint8Array<ArrayBuffer>): Promise<string>
   dispose(): void
 }
@@ -115,6 +124,7 @@ export interface RunnerOptions {
   settings: Settings
   environment: Environment
   payloads: PayloadService
+  prepared?: PreparedFiles
   signal: AbortSignal
   onProgress(progress: Progress): void
   onFile(result: FileResult): Promise<void>

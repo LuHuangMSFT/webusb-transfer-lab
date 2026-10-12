@@ -28,7 +28,9 @@ test('remembers the complete configuration on refresh and in another tab without
   await page.locator('#tags').fill(values.tags)
   await page.locator('#notes').fill(values.notes)
   await expect(page.locator('#settings-error')).toHaveText('Workload is valid.')
-  expect(await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), KEY)).toEqual({ version: 1, values })
+  expect(await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), KEY)).toEqual({
+    version: 1, values: { ...values, preGenerate: false, reuseAcrossRounds: false },
+  })
   await page.locator('#diagnostics summary').click()
   await page.locator('#diagnostic-tracing').check()
   await page.reload()
@@ -68,6 +70,36 @@ for (const [unit, size] of [['1', '257'], ['1024', '1.5'], ['1073741824', '0.125
     await expect(page.locator('#settings-error')).toHaveText('Workload is valid.')
   })
 }
+
+test('remembers preparation options but never restores ready payloads or starts generation', async ({ page }) => {
+  await page.goto('./')
+  await page.locator('#pre-generate').check()
+  await page.locator('#reuse-across-rounds').check()
+  await page.reload()
+  await expect(page.locator('#pre-generate')).toBeChecked()
+  await expect(page.locator('#reuse-across-rounds')).toBeChecked()
+  await expect(page.locator('#prepare-files')).toBeEnabled()
+  await expect(page.locator('#preparation-status')).toContainText('No prepared files')
+  await expect(page.locator('#discard-prepared')).toBeDisabled()
+  await expect(page.locator('#start')).toBeDisabled()
+  await expect(page.locator('#payload-memory')).toContainText('10 MiB')
+  await page.locator('#preset-small').click()
+  await page.reload()
+  await expect(page.locator('#pre-generate')).toBeChecked()
+  await expect(page.locator('#reuse-across-rounds')).toBeChecked()
+})
+
+test('restores old preferences with both new options off and without rewriting them', async ({ page }) => {
+  await page.goto('./')
+  const raw = JSON.stringify({ version: 1, values })
+  await page.evaluate(({ key, raw }) => localStorage.setItem(key, raw), { key: KEY, raw })
+  await page.reload()
+  await expect(page.locator('#file-count')).toHaveValue('5')
+  await expect(page.locator('#pre-generate')).not.toBeChecked()
+  await expect(page.locator('#reuse-across-rounds')).not.toBeChecked()
+  await expect(page.locator('#settings-storage-error')).toBeHidden()
+  expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(raw)
+})
 
 for (const [preset, count, size] of [['default', '10', '1'], ['small', '100', '0.0625'], ['large', '8', '16']]) {
   test(`remembers the ${preset} preset without clearing the seed or bookkeeping`, async ({ page }) => {
@@ -120,6 +152,8 @@ for (const [name, raw] of [
   ['future version', JSON.stringify({ version: 2, values })],
   ['unknown field', JSON.stringify({ version: 1, values: { ...values, autoStart: 'true' } })],
   ['wrong field type', JSON.stringify({ version: 1, values: { ...values, notes: 42 } })],
+  ['wrong preparation type', JSON.stringify({ version: 1, values: { ...values, preGenerate: 'true' } })],
+  ['null reuse option', JSON.stringify({ version: 1, values: { ...values, reuseAcrossRounds: null } })],
   ['unsupported unit', JSON.stringify({ version: 1, values: { ...values, sizeUnit: '1000' } })],
   ['oversized input', ' '.repeat(32_769)],
 ]) {

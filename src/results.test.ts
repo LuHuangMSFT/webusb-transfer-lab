@@ -1,9 +1,19 @@
 import { describe, expect, it } from 'vitest'
 import {
-  aggregateResults, compareReports, csvCell, MAX_IMPORT_BYTES, MAX_IMPORT_FILES,
+  aggregateResults, compareReports, compareSummaries, csvCell, MAX_IMPORT_BYTES, MAX_IMPORT_FILES,
   nearestRank, parseReportJson, reportLabel, reportToCsv, validateReport,
 } from './results'
-import type { FileResult, RunReport } from './types'
+import type { FileResult, RunReport, Settings } from './types'
+
+const preparationModes: Array<Pick<Settings, 'preGenerate' | 'reuseAcrossRounds'>> = [
+  {},
+  { preGenerate: false, reuseAcrossRounds: false },
+  { preGenerate: false, reuseAcrossRounds: true },
+  { preGenerate: true, reuseAcrossRounds: false },
+  { preGenerate: true, reuseAcrossRounds: true },
+  { preGenerate: true },
+  { reuseAcrossRounds: true },
+]
 
 function fixture(): RunReport {
   const id = 'c793f117-4316-4280-841c-4239d8a29616'
@@ -97,8 +107,44 @@ describe('strict, privacy-bounded report import', () => {
     expect(report.run.settings).not.toHaveProperty('tags')
     const parsed = parseReportJson(JSON.stringify(report))
     expect(parsed).toEqual(report)
+    expect(parsed.run.settings).not.toHaveProperty('preGenerate')
+    expect(parsed.run.settings).not.toHaveProperty('reuseAcrossRounds')
+    expect(parseReportJson(JSON.stringify(parsed))).toEqual(report)
     expect(reportLabel(parsed.run)).toBe('baseline · arm64')
     expect(reportToCsv(parsed)).toContain('"baseline","arm64"')
+  })
+
+  it.each(preparationModes)('round trips optional payload preparation settings: %j', (options) => {
+    const report = fixture()
+    Object.assign(report.run.settings, options)
+    for (const file of report.files) {
+      if (options.preGenerate || (options.reuseAcrossRounds && file.round > 1)) file.prepareMs = 0
+    }
+    report.run.totals.prepareMs = report.files.reduce((total, file) => total + file.prepareMs, 0)
+    const parsed = parseReportJson(JSON.stringify(report))
+    expect(parsed).toEqual(report)
+    expect(parsed.schemaVersion).toBe(1)
+    expect(parsed.run.schemaVersion).toBe(1)
+    expect(parseReportJson(JSON.stringify(parsed))).toEqual(report)
+    for (const key of ['preGenerate', 'reuseAcrossRounds'] as const) {
+      expect(Object.hasOwn(parsed.run.settings, key)).toBe(Object.hasOwn(options, key))
+    }
+  })
+
+  it.each(['preGenerate', 'reuseAcrossRounds'])('rejects non-boolean provided %s values', (key) => {
+    for (const value of [null, 'true', 'false', '', 0, 1, [], {}, undefined]) {
+      const report = fixture()
+      const invalid = { ...report, run: { ...report.run, settings: { ...report.run.settings, [key]: value } } }
+      expect(() => validateReport(invalid)).toThrow(`${key} must be a boolean`)
+      if (value !== undefined) expect(() => parseReportJson(JSON.stringify(invalid))).toThrow(`${key} must be a boolean`)
+    }
+  })
+
+  it('rejects unrecognized payload preparation fields', () => {
+    const report = fixture()
+    expect(() => validateReport({
+      ...report, run: { ...report.run, settings: { ...report.run.settings, preGenerated: true } },
+    })).toThrow('unexpected field "preGenerated"')
   })
 
   it('rejects malformed or oversized optional tags', () => {
@@ -344,7 +390,30 @@ describe('safe flat CSV exports', () => {
     expect(lines[0]).toContain('"recorded_files"')
     expect(lines[0]).toContain('"diagnostics_enabled"')
     expect(lines[0]).toContain('"tags"')
-    expect(lines.every((line) => line.split(',').length === 46)).toBe(true)
+    expect(lines[0]).toMatch(/,"tags","pre_generate","reuse_across_rounds","diagnostics_enabled"$/)
+    expect(lines.every((line) => line.split(',').length === 48)).toBe(true)
+  })
+
+  it.each(preparationModes)('exports normalized preparation columns on every row: %j', (options) => {
+    const report = fixture()
+    Object.assign(report.run.settings, options)
+    report.run.settings.tags = 'mode-check'
+    report.run.environment.diagnosticsEnabled = true
+    const lines = reportToCsv(report).trimEnd().split('\r\n')
+    const header = lines[0]!.split(',')
+    const preGenerateIndex = header.indexOf('"pre_generate"')
+    const reuseIndex = header.indexOf('"reuse_across_rounds"')
+    expect(preGenerateIndex).toBe(header.indexOf('"tags"') + 1)
+    expect(reuseIndex).toBe(preGenerateIndex + 1)
+    expect(header.at(-1)).toBe('"diagnostics_enabled"')
+    for (const line of lines.slice(1)) {
+      const cells = line.split(',')
+      expect(cells).toHaveLength(header.length)
+      expect(cells[preGenerateIndex]).toBe(csvCell(options.preGenerate ?? false))
+      expect(cells[reuseIndex]).toBe(csvCell(options.reuseAcrossRounds ?? false))
+      expect(cells[preGenerateIndex - 1]).toBe('"mode-check"')
+      expect(cells.at(-1)).toBe('"true"')
+    }
   })
 
   it('protects tags, legacy labels and notes and has no payload, serial or private-key columns', () => {
@@ -375,6 +444,41 @@ describe('conservative two-run comparison', () => {
     expect(result.downloadTimeDeltaPercent).toBe(-50)
     expect(result.wallTimeDeltaPercent).toBe(-20)
     expect(result.warnings.join(' ')).toContain('not a claim of statistical significance')
+  })
+
+  it('treats absent payload preparation settings as explicit false in either report', () => {
+    const first = fixture()
+    const second = candidate()
+    second.run.settings.preGenerate = false
+    second.run.settings.reuseAcrossRounds = false
+    expect(compareReports(first, second)).toMatchObject({ compatible: true, uploadTimeDeltaPercent: -50 })
+    expect(compareSummaries(second.run, first.run)).toMatchObject({ compatible: true, uploadTimeDeltaPercent: 100 })
+    expect(first.run.settings).not.toHaveProperty('preGenerate')
+    expect(first.run.settings).not.toHaveProperty('reuseAcrossRounds')
+  })
+
+  it.each(preparationModes)('allows matching preparation modes: %j', (options) => {
+    const first = fixture()
+    const second = candidate()
+    Object.assign(first.run.settings, options)
+    Object.assign(second.run.settings, options)
+    expect(compareReports(first, second)).toMatchObject({ compatible: true, uploadTimeDeltaPercent: -50 })
+  })
+
+  it.each(['preGenerate', 'reuseAcrossRounds'] as const)('blocks differing %s modes and suppresses every delta', (key) => {
+    for (const explicitFalse of [false, true]) {
+      const first = fixture()
+      const second = candidate()
+      if (explicitFalse) first.run.settings[key] = false
+      second.run.settings[key] = true
+      for (const [left, right] of [[first, second], [second, first]] as const) {
+        const result = compareReports(left, right)
+        expect(result).toMatchObject({
+          compatible: false, uploadTimeDeltaPercent: null, downloadTimeDeltaPercent: null, wallTimeDeltaPercent: null,
+        })
+        expect(result.differences.join(' ')).toContain(`Different ${key}`)
+      }
+    }
   })
 
   it('ignores all bookkeeping, including different legacy architecture values', () => {

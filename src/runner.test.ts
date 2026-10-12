@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createInProcessPayloadService } from './payload'
+import { PreparedFiles } from './prepared-files'
 import { runWorkload } from './runner'
 import type { DeviceStorage, FileResult, PayloadService, RunnerOptions, RunSummary } from './types'
 import { DEFAULT_SETTINGS } from './workload'
@@ -90,6 +91,63 @@ afterEach(() => {
 })
 
 describe('runner with simulated device storage (not hardware coverage)', () => {
+  it.each([
+    [false, false, 'round-trip'], [false, true, 'round-trip'], [true, false, 'round-trip'], [true, true, 'round-trip'],
+    [false, false, 'batch'], [false, true, 'batch'], [true, false, 'batch'], [true, true, 'batch'],
+  ] as const)('separates generation and preserves verification: pre=%s reuse=%s pattern=%s', async (preGenerate, reuseAcrossRounds, pattern) => {
+    const { options, device, records, controller } = fixture({ preGenerate, reuseAcrossRounds, pattern })
+    if (preGenerate) {
+      options.prepared = await PreparedFiles.prepare(options.settings, options.payloads, controller.signal, () => {})
+      expect(device.events.filter((event) => event.startsWith('prepare:'))).toHaveLength(reuseAcrossRounds ? 4 : 7)
+      expect(device.events.some((event) => /^(write|read|space|create)/.test(event))).toBe(false)
+      device.events.length = 0
+      vi.spyOn(options.payloads, 'prepare').mockRejectedValue(new Error('Generation must not run during pre-generated transfer'))
+    }
+    const receivedBuffers: ArrayBuffer[] = []
+    const hash = options.payloads.hash.bind(options.payloads)
+    options.payloads.hash = async (received) => {
+      receivedBuffers.push(received.buffer)
+      const sha256 = await hash(received)
+      structuredClone(received.buffer, { transfer: [received.buffer] })
+      return sha256
+    }
+    const summary = await runWorkload(options)
+    expect(summary.status).toBe('completed')
+    expect(summary.completedFiles).toBe(6)
+    expect(summary.totals.prepareMs).toBe(preGenerate ? 0 : reuseAcrossRounds ? 33 : 66)
+    expect(summary.totals.uploadedBytes).toBe(48)
+    expect(summary.totals.downloadedBytes).toBe(48)
+    expect(records.every((record) => record.passed && record.expectedSha256 === record.actualSha256)).toBe(true)
+    expect(new Set(receivedBuffers).size).toBe(7)
+    expect(device.events.filter((event) => event.startsWith('prepare:'))).toHaveLength(preGenerate ? 0 : reuseAcrossRounds ? 4 : 7)
+    expect(records.slice(3).every((record) => record.prepareMs === (preGenerate || reuseAcrossRounds ? 0 : 11))).toBe(true)
+    expect(device.files.size).toBe(0)
+    if (options.prepared) expect(() => options.prepared!.probe).toThrow('unavailable')
+  })
+
+  it('rejects missing or stale prepared files before touching USB or saving a report', async () => {
+    const { options, device, starts, controller } = fixture({ preGenerate: true })
+    await expect(runWorkload(options)).rejects.toThrow('Prepare all files')
+    options.prepared = await PreparedFiles.prepare(options.settings, options.payloads, controller.signal, () => {})
+    device.events.length = 0
+    options.settings.seed = 'changed'
+    await expect(runWorkload(options)).rejects.toThrow('current settings')
+    expect(device.events).toEqual([])
+    expect(starts).toEqual([])
+    options.prepared.dispose()
+  })
+
+  it.each(['failure', 'stop'] as const)('releases prepared files after transfer %s', async (scenario) => {
+    const { options, device, controller } = fixture({ preGenerate: true, reuseAcrossRounds: true })
+    options.prepared = await PreparedFiles.prepare(options.settings, options.payloads, controller.signal, () => {})
+    if (scenario === 'failure') device.fail = 'read:r000001-f001.bin'
+    else device.onCall = (event) => { if (event === 'write:r000001-f001.bin') controller.abort() }
+    const summary = await runWorkload(options)
+    expect(summary.status).toBe(scenario === 'failure' ? 'failed' : 'canceled')
+    expect(() => options.prepared!.probe).toThrow('unavailable')
+    expect(() => options.prepared!.take(2, 1)).toThrow('missing')
+  })
+
   it('marks diagnostic runs and records phase, file, and completion context without user input', async () => {
     setDiagnosticsEnabled(true)
     clearDiagnostics()

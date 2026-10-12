@@ -91,7 +91,7 @@ function describeError(error: Error): ErrorDetail {
   const code = errorCodes.has(message) ? message
     : typeof DOMException !== 'undefined' && error instanceof DOMException ? error.code : undefined
   const sources = (error.stack ?? '').slice(0, 16_384).split('\n').slice(1, 12).flatMap((line) => {
-    const match = line.match(/\/(?:webusb-transfer-lab\/)?(?:assets\/(?:index|payload\.worker)-[\w-]+\.js|src\/(?:adb-client|runner|payload|main|results|workload|diagnostics|install)\.ts):\d+:\d+/)
+    const match = line.match(/\/(?:webusb-transfer-lab\/)?(?:assets\/(?:index|payload\.worker)-[\w-]+\.js|src\/(?:adb-client|runner|payload|prepared-files|main|results|workload|diagnostics|install)\.ts):\d+:\d+/)
     return match ? [match[0]] : []
   }).slice(0, 4)
   return { name: errorNames.has(error.name) ? error.name : 'Error', reason, ...(code === undefined ? {} : { code }), sources }

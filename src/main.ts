@@ -1,9 +1,10 @@
 import './style.css'
 import { AdbClient } from './adb-client'
 import { createPayloadService } from './payload'
+import { PreparedFiles } from './prepared-files'
 import { runWorkload } from './runner'
 import { setupInstall } from './install'
-import { DEFAULT_SETTINGS, estimateWorkload, LIMITS, validateSettings } from './workload'
+import { DEFAULT_SETTINGS, estimateWorkload, LIMITS, retainedPayloadBytes, validateSettings } from './workload'
 import {
   aggregateResults, compareSummaries, MAX_IMPORT_BYTES, parseReportJson, reportLabel, ReportStore,
 } from './results'
@@ -140,6 +141,14 @@ app.innerHTML = `
             </div>
             <p id="workload-limits" class="hint">Limits: 100 files · 1 GiB per file · 1 GiB of unique payload per round. Byte sizes must be positive whole numbers.</p>
             <p class="hint">Large files use substantial browser memory. Generation, readback and hashing buffer whole files; a 1 GiB file can require several GiB of RAM.</p>
+            <div class="form-divider"></div>
+            <h3>Payload preparation</h3>
+            <label class="payload-option"><input id="pre-generate" type="checkbox" aria-describedby="pre-generate-hint"> Pre-generate files before transfer</label>
+            <p id="pre-generate-hint" class="hint">Prepare every configured file first, then start your external recording and transfer. Preparation does not use USB. Transfer stays disabled until all files are ready.</p>
+            <label class="payload-option"><input id="reuse-across-rounds" type="checkbox" aria-describedby="reuse-hint"> Reuse the same files across rounds</label>
+            <p id="reuse-hint" class="hint">Keep one round of payloads and expected hashes in memory instead of generating them again. Without pre-generation, the first round still generates files. File contents stay identical either way; every download is still independently verified.</p>
+            <p id="payload-memory" class="hint"></p>
+            <p class="hint">Prepared payloads are limited to 1 GiB and 20,000 files, plus a tiny capability probe. Readback, hashing and worker buffers need additional RAM. Payloads are only for the next run; they are freed when it ends and are never saved across refreshes.</p>
             <p class="hint">Configuration, tags and notes are remembered in this browser as you edit. Restoring them never connects a device or starts a run.</p>
             <div id="settings-storage-error" class="notice warning" role="alert" hidden></div>
             <div class="form-divider"></div>
@@ -155,6 +164,16 @@ app.innerHTML = `
             <div><dt>Per round</dt><dd id="estimate-round">—</dd></div><div><dt>Total USB payload ↔</dt><dd id="estimate-traffic">—</dd></div><div><dt>Peak phone payload</dt><dd id="estimate-peak">—</dd></div>
           </dl>
           <p class="hint">Traffic counts both directions across all rounds, excluding ADB overhead. Phone storage requires additional safety headroom.</p>
+          <div id="preparation-panel" hidden>
+            <div class="button-row">
+              <button id="prepare-files" type="button">Prepare files</button>
+              <button id="cancel-preparation" type="button" disabled>Cancel preparation</button>
+              <button id="discard-prepared" type="button" disabled>Discard prepared files</button>
+            </div>
+            <p id="preparation-status" class="hint" role="status">No prepared files. Prepare before starting your recording.</p>
+            <label class="sr-only" for="preparation-progress">File preparation progress</label>
+            <progress id="preparation-progress" value="0" max="1"></progress>
+          </div>
           <div class="run-actions"><button id="start" type="submit" class="primary" disabled>Start verified run</button><button id="stop" type="button" class="danger-outline" disabled>Stop run</button></div>
           <p id="start-hint" class="hint">Connect a phone to start. Tags and notes are optional.</p>
         </form>
@@ -169,7 +188,7 @@ app.innerHTML = `
           <p>These are <strong>application end-to-end times</strong>, including ADB, filesystem behavior, copies, and browser scheduling—not bare SYNC-call durations or pure WinUSB latency.</p>
           <p>Byte totals count known completed transfers. Failed streams may move uncounted partial bytes while still contributing elapsed time; partial-run throughput is not a complete measurement.</p>
           <p>Setup, payload generation / expected SHA-256, readback SHA-256 / size checks, and cleanup are timed separately. Successful readback is <strong>not proof of durable flash writes</strong>; caches and thermal state still matter.</p>
-          <details><summary>External profiling checklist</summary><ol><li>Start WPR and/or a browser performance recording manually.</li><li>Run a reproducible workload.</li><li>Stop the recording and save it with this report and matching browser symbols.</li><li>Use Windows stacks and USB traces to attribute timing differences. This site cannot start WPR or collect privileged profiles.</li></ol></details>
+          <details><summary>External profiling checklist</summary><ol><li>To exclude generation, enable pre-generation and click Prepare files. Wait for Ready; reuse across rounds retains only one round of payloads.</li><li>Start WPR and/or a browser performance recording manually, then click Start transfer. Device setup, readback hashing and cleanup still run during the recording.</li><li>Stop the recording and save it with this report and matching browser symbols.</li><li>Use Windows stacks and USB traces to attribute timing differences. This site cannot start WPR or collect privileged profiles.</li></ol></details>
         </section>
       </aside>
     </div>
@@ -233,6 +252,13 @@ const seed = element<HTMLInputElement>('seed')
 const tags = element<HTMLInputElement>('tags')
 const notes = element<HTMLTextAreaElement>('notes')
 const preferenceControls = { fileCount, fileSize, sizeUnit, rounds, pattern, seed, tags, notes }
+const preGenerate = element<HTMLInputElement>('pre-generate')
+const reuseAcrossRounds = element<HTMLInputElement>('reuse-across-rounds')
+const booleanPreferences = { preGenerate, reuseAcrossRounds }
+const prepareButton = element<HTMLButtonElement>('prepare-files')
+const cancelPreparationButton = element<HTMLButtonElement>('cancel-preparation')
+const discardPreparedButton = element<HTMLButtonElement>('discard-prepared')
+const preparationProgress = element<HTMLProgressElement>('preparation-progress')
 const connectButton = element<HTMLButtonElement>('connect')
 const disconnectButton = element<HTMLButtonElement>('disconnect')
 const cleanupButton = element<HTMLButtonElement>('cleanup-leftovers')
@@ -249,6 +275,9 @@ let disconnecting = false
 let connectionGeneration = 0
 let cleaning = false
 let running = false
+let preparing = false
+let preparedFiles: PreparedFiles | undefined
+let preparationController: AbortController | undefined
 let stopRequested = false
 let reportsBusy = false
 let controller: AbortController | undefined
@@ -348,7 +377,7 @@ function refreshLeftovers(): void {
       item.textContent = `And ${leftovers.length - 20} more recorded runs.`
       list.append(item)
     }
-    cleanupButton.disabled = !client.connected || running || cleaning || connecting || disconnecting || leftovers.length === 0
+    cleanupButton.disabled = !client.connected || running || preparing || cleaning || connecting || disconnecting || leftovers.length === 0
   } catch (error) {
     diagnosticError('app.cleanup.records.failed', 'Cleanup records cannot be read. No files will be removed.', error)
     message('app-error', `Could not read cleanup records: ${errorMessage(error)}`)
@@ -365,6 +394,8 @@ function readSettings(): Settings {
     rounds: rounds.valueAsNumber,
     pattern: selectedPattern,
     seed: seed.value,
+    preGenerate: preGenerate.checked,
+    reuseAcrossRounds: reuseAcrossRounds.checked,
     tags: tags.value,
     notes: notes.value,
   })
@@ -379,11 +410,21 @@ function restorePreferences(): void {
     const record = (value: unknown): value is Record<string, unknown> =>
       value !== null && typeof value === 'object' && !Array.isArray(value)
     if (!record(saved) || saved.version !== 1 || !record(saved.values)
-      || Object.keys(saved).sort().join(',') !== 'values,version'
-      || Object.keys(saved.values).sort().join(',') !== Object.keys(preferenceControls).sort().join(',')) {
+      || Object.keys(saved).sort().join(',') !== 'values,version') {
       throw new Error('Saved configuration has an unsupported format.')
     }
     const values = saved.values
+    if (Object.keys(preferenceControls).some((key) => !Object.hasOwn(values, key)) ||
+        Object.keys(values).some((key) => !Object.hasOwn(preferenceControls, key) && !Object.hasOwn(booleanPreferences, key))) {
+      throw new Error('Saved configuration has unsupported fields.')
+    }
+    const booleans = Object.entries(booleanPreferences).map(([key, control]) => {
+      const value = values[key] ?? false
+      if ((Object.hasOwn(values, key) && typeof values[key] !== 'boolean') || typeof value !== 'boolean') {
+        throw new Error('Saved preparation options must be booleans.')
+      }
+      return { control, value }
+    })
     const restored = Object.entries(preferenceControls).map(([key, control]) => {
       const value = values[key]
       const maximum = control instanceof HTMLSelectElement ? 32 : control.maxLength > 0 ? control.maxLength : 128
@@ -406,6 +447,7 @@ function restorePreferences(): void {
     })
     // Validate the complete snapshot before changing any visible field.
     for (const { control, value } of restored) control.value = value
+    for (const { control, value } of booleans) control.checked = value
   } catch (error) {
     diagnosticError('app.settings.restore.failed', 'Saved configuration could not be restored. Review the defaults before running.', error)
     message('settings-storage-error', 'Saved configuration could not be restored. Defaults are shown. Changing a field will try saving again.')
@@ -417,7 +459,10 @@ function settingsChanged(): void {
   try {
     const raw = JSON.stringify({
       version: 1,
-      values: Object.fromEntries(Object.entries(preferenceControls).map(([key, control]) => [key, control.value])),
+      values: {
+        ...Object.fromEntries(Object.entries(preferenceControls).map(([key, control]) => [key, control.value])),
+        ...Object.fromEntries(Object.entries(booleanPreferences).map(([key, control]) => [key, control.checked])),
+      },
     })
     localStorage.setItem(SETTINGS_KEY, raw)
     if (localStorage.getItem(SETTINGS_KEY) !== raw) throw new Error('Configuration persistence could not be confirmed.')
@@ -446,6 +491,14 @@ function updateSettings(): void {
     element('settings-error').textContent = errorMessage(error)
     element('settings-error').className = 'form-message'
   }
+  if (preparedFiles && (!settings || !preparedFiles.matches(settings))) {
+    discardPrepared('Settings changed. Prepare files again before starting your recording.')
+  }
+  element('preparation-panel').hidden = !preGenerate.checked
+  element('payload-memory').textContent = settings
+    ? `Retained payload memory: ${bytes(retainedPayloadBytes(settings))}${settings.preGenerate && !settings.reuseAcrossRounds
+      ? ' across all rounds' : settings.reuseAcrossRounds ? ' for one round' : ' (only the active file is generated)'}. Additional working memory is required.`
+    : 'Retained payload estimate unavailable until the workload is valid.'
   // Invalid optional metadata should not hide otherwise useful byte estimates.
   try {
     const estimate = estimateWorkload(validateSettings({
@@ -467,29 +520,38 @@ function updateSettings(): void {
 }
 
 function updateControls(): void {
-  const busy = running || cleaning || connecting || disconnecting || installer.prompting
+  const busy = running || preparing || cleaning || connecting || disconnecting || installer.prompting
+  const preparedReady = settings !== undefined && preparedFiles?.matches(settings) === true
   installer.refresh(busy || reportsBusy || client.connected)
   diagnosticCheckbox.disabled = busy || reportsBusy
   element<HTMLButtonElement>('download-diagnostics').disabled = busy || reportsBusy
   element<HTMLButtonElement>('clear-diagnostics').disabled = busy || reportsBusy
   element('diagnostic-warning').hidden = !diagnosticsEnabled()
-  settingsFields.disabled = running || cleaning
+  settingsFields.disabled = running || preparing || cleaning
   connectButton.disabled = !supported || busy || client.connected
-  disconnectButton.disabled = (!client.connected && !connecting) || cleaning || disconnecting
+  disconnectButton.disabled = (!client.connected && !connecting) || preparing || cleaning || disconnecting
   disconnectButton.textContent = connecting ? 'Cancel connection' : running && controller ? 'Disconnect & stop' : 'Disconnect'
-  startButton.disabled = !supported || !client.connected || busy || !settings || !storageReady || reportsBusy
+  startButton.disabled = !supported || !client.connected || busy || !settings || !storageReady || reportsBusy ||
+    (Boolean(settings?.preGenerate) && !preparedReady)
+  startButton.textContent = preGenerate.checked ? 'Start transfer' : 'Start verified run'
+  prepareButton.disabled = busy || reportsBusy || !settings || !preGenerate.checked
+  cancelPreparationButton.disabled = !preparing || preparationController?.signal.aborted === true
+  discardPreparedButton.disabled = busy || !preparedFiles
   stopButton.disabled = !running || stopRequested || !controller
   stopButton.textContent = stopRequested ? 'Stopping…' : 'Stop run'
-  element('start-hint').textContent = running ? (controller ? 'Settings are frozen until the transfer stops and cleanup finishes.' : 'Transfer finished. Finalizing the local report and timing statistics…')
+  element('start-hint').textContent = preparing ? 'Preparing files only. Wait for Ready before starting your external recording.'
+    : running ? (controller ? 'Settings are frozen until the transfer stops and cleanup finishes.' : 'Transfer finished. Finalizing the local report and timing statistics…')
     : !supported ? 'A secure, native desktop Chromium browser with WebUSB is required.'
       : !storageReady ? 'Local report storage must be available before a run can start.'
         : !client.connected ? 'Connect a phone to start. Tags and notes are optional.'
           : !settings ? 'Review the workload settings above.'
             : reportsBusy ? 'Wait for the local report operation to finish before measuring.'
+              : settings.preGenerate && !preparedReady ? 'Click Prepare files first. Start transfer is enabled only when every file is ready.'
+                : settings.preGenerate ? 'Files ready. Start your external recording, then click Start transfer.'
               : 'Ready. Stop ends scheduling immediately; a disconnected session may require reconnecting for cleanup.'
   for (const control of document.querySelectorAll<HTMLButtonElement | HTMLSelectElement | HTMLInputElement>(
     '#reports button, #reports select, #reports input',
-  )) control.disabled = running || reportsBusy
+  )) control.disabled = running || preparing || reportsBusy
   refreshLeftovers()
 }
 
@@ -508,6 +570,8 @@ fileSize.step = 'any'
 rounds.value = String(DEFAULT_SETTINGS.rounds)
 pattern.value = DEFAULT_SETTINGS.pattern
 seed.value = DEFAULT_SETTINGS.seed
+preGenerate.checked = DEFAULT_SETTINGS.preGenerate ?? false
+reuseAcrossRounds.checked = DEFAULT_SETTINGS.reuseAcrossRounds ?? false
 restorePreferences()
 element('site-version').textContent = SITE_VERSION
 element('site-commit').textContent = environment.siteCommit
@@ -542,8 +606,60 @@ element('preset-default').addEventListener('click', () => setPreset(10, 1, 3))
 element('preset-small').addEventListener('click', () => setPreset(100, 0.0625, 3))
 element('preset-large').addEventListener('click', () => setPreset(8, 16, 3))
 
+function discardPrepared(status: string): void {
+  preparedFiles?.dispose()
+  preparedFiles = undefined
+  preparationProgress.value = 0
+  element('preparation-status').textContent = status
+}
+
+discardPreparedButton.addEventListener('click', () => {
+  if (discardPreparedButton.disabled) return
+  discardPrepared('Prepared files discarded. Prepare again before starting your recording.')
+  updateControls()
+})
+
+cancelPreparationButton.addEventListener('click', () => {
+  preparationController?.abort(new Error('File preparation canceled.'))
+  updateControls()
+})
+
+prepareButton.addEventListener('click', async () => {
+  updateSettings()
+  if (prepareButton.disabled || !settings) return
+  const snapshot = settings
+  discardPrepared('Generating payloads and expected hashes. Do not start recording yet.')
+  preparing = true
+  const cancellation = new AbortController()
+  preparationController = cancellation
+  message('app-error', '')
+  updateControls()
+  let service: PayloadService | undefined
+  try {
+    service = createPayloadService()
+    preparedFiles = await PreparedFiles.prepare(snapshot, service, cancellation.signal, (completed, total) => {
+      preparationProgress.max = total
+      preparationProgress.value = completed
+      element('preparation-status').textContent = `Preparing ${completed.toLocaleString()} / ${total.toLocaleString()} files, including expected SHA-256. No USB transfers.`
+    })
+    element('preparation-status').textContent = `Ready. ${bytes(retainedPayloadBytes(snapshot))} of payloads prepared. Start your external recording, then click Start transfer after connecting.`
+  } catch (error) {
+    discardPrepared(cancellation.signal.aborted ? 'Preparation canceled. No USB transfers were started.'
+      : 'Preparation failed. No files are ready; reduce the workload or retry.')
+    if (!cancellation.signal.aborted) {
+      diagnosticError('app.prepare.failed', 'File preparation failed. Reduce the workload or retry before recording.', error)
+      message('app-error', errorMessage(error))
+    }
+  } finally {
+    service?.dispose()
+    preparing = false
+    preparationController = undefined
+    updateControls()
+  }
+})
+
 connectButton.addEventListener('click', async () => {
-  if (connecting || running || client.connected || !supported) return
+  if (connecting || running || preparing || client.connected || !supported) return
   message('app-error', '')
   connecting = true
   const attempt = ++connectionGeneration
@@ -566,7 +682,7 @@ connectButton.addEventListener('click', async () => {
 })
 
 disconnectButton.addEventListener('click', async () => {
-  if (disconnecting) return
+  if (disconnecting || preparing) return
   ++connectionGeneration
   connecting = false
   disconnecting = true
@@ -587,7 +703,7 @@ disconnectButton.addEventListener('click', async () => {
 })
 
 cleanupButton.addEventListener('click', async () => {
-  if (running || cleaning || !client.connected) return
+  if (running || preparing || cleaning || !client.connected) return
   cleaning = true
   message('app-error', '')
   setConnection('Cleaning up', 'Removing only recorded app-owned test files on this phone…')
@@ -686,6 +802,9 @@ form.addEventListener('submit', async (event) => {
   updateSettings()
   if (startButton.disabled || !settings) return
   const runSettings = { ...settings }
+  const prepared = preparedFiles
+  preparedFiles = undefined
+  if (prepared) element('preparation-status').textContent = 'Prepared files assigned to this run. Prepare again for another run.'
   running = true
   stopRequested = false
   controller = new AbortController()
@@ -710,7 +829,7 @@ form.addEventListener('submit', async (event) => {
   try {
     payloads = createPayloadService()
     const summary = await runWorkload({
-      device: client, settings: runSettings, environment, payloads, signal: controller.signal,
+      device: client, settings: runSettings, environment, payloads, prepared, signal: controller.signal,
       onStart: async (summary) => {
         await store.start(summary)
         activeRunId = summary.id
@@ -780,6 +899,8 @@ form.addEventListener('submit', async (event) => {
     }
   } finally {
     payloads?.dispose()
+    prepared?.dispose()
+    if (runSettings.preGenerate) discardPrepared('Run ended. Prepared files released; prepare again before another recording.')
     running = false
     controller = undefined
     activeRunId = undefined
@@ -867,7 +988,7 @@ async function refreshReports(): Promise<void> {
 }
 
 async function reportAction(action: () => Promise<void>): Promise<void> {
-  if (running || reportsBusy) return
+  if (running || preparing || reportsBusy) return
   reportsBusy = true
   message('report-error', '')
   element('report-status').textContent = 'Reading local report data…'
@@ -984,10 +1105,12 @@ for (const slot of ['a', 'b'] as const) {
 }
 
 window.addEventListener('beforeunload', (event) => {
-  if (!running) return
+  if (!running && !preparing) return
   event.preventDefault()
 })
 window.addEventListener('pagehide', () => {
+  preparationController?.abort(new Error('The page is closing.'))
+  preparedFiles?.dispose()
   controller?.abort(new Error('The page is closing.'))
   if (client.connected) client.abort()
 })

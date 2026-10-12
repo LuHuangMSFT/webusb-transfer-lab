@@ -1,4 +1,4 @@
-import type { DeviceStorage, FileResult, Phase, RunnerOptions, RunSummary } from './types'
+import type { DeviceStorage, FileResult, Payload, Phase, RunnerOptions, RunSummary } from './types'
 import { estimateWorkload, validateSettings } from './workload'
 import { diagnosticError, diagnosticsEnabled, trace } from './diagnostics'
 
@@ -19,6 +19,14 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   const estimate = estimateWorkload(settings)
   const { device, payloads, signal } = options
   if (activeDevices.has(device)) throw new Error('This device already has an active run.')
+  const prepared = options.prepared
+  if (settings.preGenerate) {
+    if (!prepared) throw new Error('Prepare all files before starting transfer.')
+    prepared.claim(settings)
+  } else if (prepared) {
+    throw new Error('Pre-generated files require pre-generation to be enabled.')
+  }
+  const reused = new Map<number, Payload>()
   const wallStart = performance.now()
   const summary: RunSummary = {
     schemaVersion: 1,
@@ -182,10 +190,15 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
 
   async function upload(active: ActiveFile): Promise<void> {
     const result = active.result
-    progress('prepare', 'Generating one file and its expected SHA-256.')
-    const payload = await timed('prepare',
-      () => operation(() => payloads.prepare(settings.fileSizeBytes, settings.seed, result.index)), result)
+    let payload = prepared?.take(round, result.index) ?? reused.get(result.index)
+    if (!payload) {
+      progress('prepare', 'Generating one file and its expected SHA-256.')
+      payload = await timed('prepare',
+        () => operation(() => payloads.prepare(settings.fileSizeBytes, settings.seed, result.index)), result)
+      if (settings.reuseAcrossRounds) reused.set(result.index, payload)
+    }
     if (payload.bytes.byteLength !== settings.fileSizeBytes) throw new Error('Generated payload has the wrong size.')
+    if (round === settings.rounds) reused.delete(result.index)
     result.expectedSha256 = payload.sha256
     progress('upload', `Uploading ${result.name}.`)
     checkCanceled()
@@ -250,7 +263,7 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
       await operation(() => device.createRun(summary.id))
       runCreated = true
       const size = Math.min(64, settings.fileSizeBytes)
-      const probe = await operation(() => payloads.prepare(size, settings.seed, 0))
+      const probe = prepared ? prepared.probe : await operation(() => payloads.prepare(size, settings.seed, 0))
       filesOnDevice.add('probe.bin')
       await operation(() => device.writeFile(summary.id, 'probe.bin', probe.bytes))
       if (await operation(() => device.statFile(summary.id, 'probe.bin')) !== size) {
@@ -339,6 +352,8 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
     trace('run.end', { runId: summary.id, status: summary.status, files: summary.completedFiles,
       pending: summary.leftovers.length, durationMs: summary.totals.wallMs })
     activeDevices.delete(device)
+    reused.clear()
+    prepared?.dispose()
   }
   return summary
 }
