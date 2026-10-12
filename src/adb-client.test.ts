@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ReadableStream } from '@yume-chan/stream-extra'
 import type { AdbCredentialStore, AdbPrivateKey } from '@yume-chan/adb'
 import { AdbClient, parseAvailableBytes } from './adb-client'
+import { clearDiagnostics, diagnosticSnapshot, setDiagnosticsEnabled } from './diagnostics'
 
 // These are protocol-boundary mocks, not real USB or phone verification.
 const boundary = vi.hoisted(() => ({
@@ -160,6 +161,8 @@ let client: AdbClient
 let disconnected: ReturnType<typeof vi.fn<() => void>>
 
 beforeEach(() => {
+  setDiagnosticsEnabled(false)
+  clearDiagnostics()
   vi.clearAllMocks()
   fixture = makeFixture()
   vi.stubGlobal('isSecureContext', true)
@@ -278,6 +281,9 @@ describe('native WebUSB connection', () => {
     await connection
     expect(fixture.usb.close).toHaveBeenCalled()
     expect(client.connected).toBe(false)
+    expect(diagnosticSnapshot().entries).toContainEqual(expect.objectContaining({
+      event: 'adb.timeout', context: expect.objectContaining({ timeoutMs: 120_000 }),
+    }))
   })
 
   it('records teardown rejection without an unhandled promise or a live connection', async () => {
@@ -287,6 +293,9 @@ describe('native WebUSB connection', () => {
     expect(client.connected).toBe(false)
     await expect(client.disconnect()).rejects.toThrow(/teardown/)
     expect(client.lastError).toMatch(/teardown/)
+    expect(diagnosticSnapshot().entries).toContainEqual(expect.objectContaining({
+      event: 'adb.teardown.failed', context: expect.objectContaining({ operation: 'USB close' }),
+    }))
   })
 })
 
@@ -398,6 +407,31 @@ describe('owned paths and capability checks', () => {
 })
 
 describe('bounded actual SYNC transfers', () => {
+  it('retains the failing file identity and native errno without serials or payloads', async () => {
+    await createRun()
+    clearDiagnostics()
+    fixture.sync.write.mockRejectedValue(new Error('EIO'))
+    await expect(client.writeFile(RUN, NAME, new Uint8Array([91, 92, 93]))).rejects.toThrow('upload failed')
+    const log = diagnosticSnapshot()
+    expect(log.entries.filter((entry) => entry.level === 'error')).toHaveLength(1)
+    expect(log.entries[0]).toMatchObject({
+      event: 'adb.operation.failed',
+      context: { runId: RUN, round: 1, index: 1, bytes: 3, operation: 'write file' },
+    })
+    expect(log.entries[0].errors?.some((error) => error.code === 'EIO')).toBe(true)
+    expect(JSON.stringify(log)).not.toMatch(/private-device-serial|Test phone|91,92,93/)
+  })
+
+  it('keeps a successful real-adapter mock workload quiet by default', async () => {
+    await createRun()
+    await client.writeFile(RUN, NAME, new Uint8Array([1, 2, 3]))
+    await client.readFile(RUN, NAME, 3)
+    await client.removeFile(RUN, NAME)
+    await client.cleanupRun(RUN)
+    await client.disconnect()
+    expect(diagnosticSnapshot().entries).toEqual([])
+  })
+
   it('accepts canonical filenames for rounds beyond six digits', async () => {
     await createRun()
     const name = 'r1000000-f001.bin'

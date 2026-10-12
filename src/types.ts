@@ -73,6 +73,7 @@ export interface Environment {
   siteVersion: string
   browser: string
   dependencies: Record<string, string>
+  diagnosticsEnabled?: boolean
 }
 
 export interface RunSummary {

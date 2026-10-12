@@ -78,6 +78,21 @@ function partial(): RunReport {
 }
 
 describe('strict, privacy-bounded report import', () => {
+  it('accepts legacy reports and validates optional diagnostic metadata', () => {
+    expect(validateReport(fixture()).run.environment.diagnosticsEnabled).toBeUndefined()
+    const report = fixture()
+    report.run.environment.diagnosticsEnabled = true
+    expect(validateReport(report).run.environment.diagnosticsEnabled).toBe(true)
+    expect(reportToCsv(report).split('\r\n')[1]).toMatch(/,"true"$/)
+    expect(() => validateReport({
+      ...report, run: { ...report.run, environment: { ...report.run.environment, diagnosticsEnabled: 'yes' } },
+    })).toThrow('diagnosticsEnabled')
+    expect(compareReports(report, candidate())).toMatchObject({ compatible: false, uploadTimeDeltaPercent: null })
+    const second = candidate()
+    second.run.environment.diagnosticsEnabled = true
+    expect(compareReports(report, second).differences.join(' ')).toContain('diagnostic tracing')
+  })
+
   it('round trips a valid versioned report and reconstructs a separate typed object', () => {
     const source = fixture()
     const parsed = parseReportJson(JSON.stringify(source))
@@ -277,7 +292,8 @@ describe('safe flat CSV exports', () => {
     expect(lines.filter((line) => line.startsWith('"round"'))).toHaveLength(2)
     expect(lines.at(-1)).toContain('"run"')
     expect(lines[0]).toContain('"recorded_files"')
-    expect(lines.every((line) => line.split(',').length === 44)).toBe(true)
+    expect(lines[0]).toContain('"diagnostics_enabled"')
+    expect(lines.every((line) => line.split(',').length === 45)).toBe(true)
   })
 
   it('protects user labels and notes and has no payload, serial or private-key columns', () => {

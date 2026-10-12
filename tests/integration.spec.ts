@@ -87,3 +87,15 @@ test('failed file persistence leaves the last consistent report exportable', asy
   expect(result.report.run.completedFiles).toBe(0)
   expect(result.phoneFiles).toBe(0)
 })
+
+test('diagnostic runner markers survive real IndexedDB and JSON/CSV exports', async ({ page }) => {
+  await page.goto('http://127.0.0.1:4174/webusb-transfer-lab/tests/harness.html')
+  await page.waitForFunction(() => typeof window.simulate === 'function')
+  const result = await page.evaluate(() => window.simulate('round-trip', 'success', true))
+  expect(result.report.run.status).toBe('completed')
+  expect(result.report.run.environment.diagnosticsEnabled).toBe(true)
+  expect(result.csv.split('\r\n')[0]).toContain('"diagnostics_enabled"')
+  expect(result.csv.split('\r\n')[1]).toMatch(/,"true"$/)
+  expect(result.diagnostics.entries.some((entry) => entry.event === 'run.phase.end'
+    && entry.context.phase === 'download' && entry.context.round === 1 && entry.context.index === 1)).toBe(true)
+})

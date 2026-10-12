@@ -101,7 +101,8 @@ function parseDevice(value: unknown): DeviceInfo {
 
 function parseEnvironment(value: unknown): Environment {
   const source = object(value, 'environment')
-  fields(source, ['siteCommit', 'siteVersion', 'browser', 'dependencies'])
+  fields(source, ['siteCommit', 'siteVersion', 'browser', 'dependencies'], ['diagnosticsEnabled'])
+  if (source.diagnosticsEnabled !== undefined && typeof source.diagnosticsEnabled !== 'boolean') invalid('diagnosticsEnabled must be a boolean.')
   const dependencies = object(source.dependencies, 'dependencies')
   fields(dependencies, dependencyNames)
   const result: Record<string, string> = {}
@@ -111,6 +112,7 @@ function parseEnvironment(value: unknown): Environment {
     siteVersion: text(source.siteVersion, 'site version', 32),
     browser: text(source.browser, 'browser', 1024),
     dependencies: result,
+    ...(source.diagnosticsEnabled === undefined ? {} : { diagnosticsEnabled: source.diagnosticsEnabled }),
   }
 }
 
@@ -368,6 +370,9 @@ export function compareSummaries(left: RunSummary, right: RunSummary): Compariso
   ]
   if (left.id === right.id) differences.push('The same run was selected twice.')
   for (const run of [left, right]) {
+    if (run.environment.diagnosticsEnabled) {
+      differences.push(`${run.settings.buildLabel}: diagnostic tracing was enabled. Repeat with tracing off for a performance comparison.`)
+    }
     if (run.status !== 'completed' || run.completedFiles !== run.expectedFiles || run.leftovers.length || run.error) {
       differences.push(`${run.settings.buildLabel}: the run is partial, failed, canceled, or has pending cleanup.`)
     }
@@ -417,7 +422,7 @@ const csvHeader = ['row_type', 'run_id', 'build_label', 'architecture', 'device_
   'schema_version', 'seed', 'pattern', 'files_per_round', 'file_size_bytes', 'rounds', 'browser',
   'site_version', 'site_commit', 'device_manufacturer', 'adb_max_payload_bytes', 'adb_features',
   'adb_version', 'webusb_version', 'stream_extra_version', 'started_at_utc', 'completed_at_utc',
-  'performance_time_origin_ms']
+  'performance_time_origin_ms', 'diagnostics_enabled']
 
 function csvLine(values: Array<string | number | boolean>): string {
   return `${values.map(csvCell).join(',')}\r\n`
@@ -432,7 +437,7 @@ function csvMetadata(run: RunSummary): Array<string | number> {
     run.settings.rounds, run.environment.browser, run.environment.siteVersion, run.environment.siteCommit,
     run.device.manufacturer, run.device.maxPayloadSize, run.device.features.join(';'),
     ...dependencyNames.map((name) => run.environment.dependencies[name] ?? ''),
-    run.startedAt, run.completedAt, run.timeOrigin]
+    run.startedAt, run.completedAt, run.timeOrigin, run.environment.diagnosticsEnabled ? 'true' : 'false']
 }
 
 function speed(bytes: number, milliseconds: number): number | string {
@@ -480,7 +485,7 @@ export function reportToCsv(value: RunReport): string {
 
 function storageError(error: unknown): Error {
   const detail = error instanceof Error ? error.message : 'Browser storage is unavailable.'
-  return new Error(`Local report storage failed: ${detail} No results are uploaded. Free site storage or allow IndexedDB, then reload.`)
+  return new Error(`Local report storage failed: ${detail} No results are uploaded. Free site storage or allow IndexedDB, then reload.`, { cause: error })
 }
 
 function request<T>(value: IDBRequest<T>): Promise<T> {

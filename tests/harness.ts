@@ -3,6 +3,7 @@ import { ReportStore, parseReportJson } from '../src/results'
 import { runWorkload } from '../src/runner'
 import { DEFAULT_SETTINGS } from '../src/workload'
 import type { DeviceStorage, Pattern } from '../src/types'
+import { diagnosticSnapshot, setDiagnosticsEnabled } from '../src/diagnostics'
 
 type Scenario = 'success' | 'corrupt' | 'cancel-commit' | 'fail-commit'
 
@@ -30,7 +31,8 @@ class SimulatedDevice implements DeviceStorage {
   abort() { this.connected = false }
 }
 
-async function simulate(pattern: Pattern, scenario: Scenario) {
+async function simulate(pattern: Pattern, scenario: Scenario, tracing = false) {
+  setDiagnosticsEnabled(tracing)
   const store = new ReportStore()
   await store.ready()
   const device = new SimulatedDevice(scenario)
@@ -62,7 +64,8 @@ async function simulate(pattern: Pattern, scenario: Scenario) {
     const json = await (await store.export(summary.id, 'json')).text()
     const csv = await (await store.export(summary.id, 'csv')).text()
     const report = parseReportJson(json)
-    return { report, csv, statistics: await store.stats(summary.id), peakFiles: device.peakFiles, phoneFiles: device.files.size, finishError }
+    return { report, csv, statistics: await store.stats(summary.id), peakFiles: device.peakFiles, phoneFiles: device.files.size, finishError,
+      diagnostics: diagnosticSnapshot() }
   } finally {
     payloads.dispose()
   }

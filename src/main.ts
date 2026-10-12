@@ -8,6 +8,15 @@ import {
 } from './results'
 import type { RunStatistics } from './results'
 import type { Environment, FileResult, PayloadService, Progress, RunSummary, Settings } from './types'
+import { clearDiagnostics, diagnosticError, diagnosticSnapshot, diagnosticsEnabled, setDiagnosticsEnabled, trace } from './diagnostics'
+
+setDiagnosticsEnabled(new URLSearchParams(location.search).get('diagnostics') === '1')
+window.addEventListener('error', (event) => {
+  diagnosticError('app.unhandled.error', 'Unexpected application error. Save diagnostics and reload before another run.', event.error)
+})
+window.addEventListener('unhandledrejection', (event) => {
+  diagnosticError('app.unhandled.rejection', 'Unexpected asynchronous failure. Save diagnostics and reload before another run.', event.reason)
+})
 
 const SITE_VERSION = '0.1.0'
 const RECENT_FILES = 20
@@ -48,6 +57,21 @@ app.innerHTML = `
 
     <div id="app-error" class="notice error" role="alert" hidden></div>
     <div id="storage-error" class="notice error" role="alert" hidden></div>
+
+    <section id="diagnostics" class="panel" aria-label="Diagnostic controls">
+      <details>
+        <summary>Diagnostics & console logging</summary>
+        <p>Errors are always recorded locally. Enable tracing <strong>before connecting</strong> to capture operation start/end, deadlines, run/file identifiers and cleanup. In DevTools Console, enable <strong>Verbose</strong>, filter by <code>[WebUSB Lab]</code>, and enable <strong>Preserve log</strong> before reproducing a problem.</p>
+        <label><input id="diagnostic-tracing" type="checkbox"> Enable diagnostic tracing (not for performance measurements)</label>
+        <p class="hint">No payloads, keys, serials, user-entered text, shell output or raw error messages are logged. Error types, known codes and source locations are retained. The download contains only the latest 500 events and is separate from performance reports; it disappears on reload.</p>
+        <div class="button-row">
+          <button id="download-diagnostics" type="button">Download diagnostic log</button>
+          <button id="clear-diagnostics" type="button">Clear diagnostic log</button>
+        </div>
+        <p id="diagnostic-status" role="status"></p>
+      </details>
+      <p id="diagnostic-warning" class="notice warning" hidden>Diagnostic tracing is on. Runs are marked diagnostic and excluded from A/B performance comparisons. Turn it off before profiling.</p>
+    </section>
 
     <section id="setup" class="panel connection-panel" aria-labelledby="connection-title">
       <div class="section-heading">
@@ -206,6 +230,8 @@ const disconnectButton = element<HTMLButtonElement>('disconnect')
 const cleanupButton = element<HTMLButtonElement>('cleanup-leftovers')
 const startButton = element<HTMLButtonElement>('start')
 const stopButton = element<HTMLButtonElement>('stop')
+const diagnosticCheckbox = element<HTMLInputElement>('diagnostic-tracing')
+diagnosticCheckbox.checked = diagnosticsEnabled()
 const progressBar = element<HTMLProgressElement>('run-progress')
 const store = new ReportStore()
 const supported = window.isSecureContext && 'usb' in navigator && Boolean(navigator.usb)
@@ -315,6 +341,7 @@ function refreshLeftovers(): void {
     }
     cleanupButton.disabled = !client.connected || running || cleaning || connecting || disconnecting || leftovers.length === 0
   } catch (error) {
+    diagnosticError('app.cleanup.records.failed', 'Cleanup records cannot be read. No files will be removed.', error)
     message('app-error', `Could not read cleanup records: ${errorMessage(error)}`)
     cleanupButton.disabled = true
   }
@@ -387,6 +414,10 @@ function updateSettings(): void {
 
 function updateControls(): void {
   const busy = running || cleaning || connecting || disconnecting
+  diagnosticCheckbox.disabled = busy || reportsBusy
+  element<HTMLButtonElement>('download-diagnostics').disabled = busy || reportsBusy
+  element<HTMLButtonElement>('clear-diagnostics').disabled = busy || reportsBusy
+  element('diagnostic-warning').hidden = !diagnosticsEnabled()
   settingsFields.disabled = running || cleaning
   connectButton.disabled = !supported || busy || client.connected
   disconnectButton.disabled = (!client.connected && !connecting) || cleaning || disconnecting
@@ -424,6 +455,31 @@ pattern.value = DEFAULT_SETTINGS.pattern
 seed.value = DEFAULT_SETTINGS.seed
 element('site-version').textContent = SITE_VERSION
 element('site-commit').textContent = environment.siteCommit
+diagnosticCheckbox.addEventListener('change', () => {
+  setDiagnosticsEnabled(diagnosticCheckbox.checked)
+  element('diagnostic-status').textContent = diagnosticsEnabled()
+    ? 'Tracing enabled for this page. Include Verbose messages in the Console.'
+    : 'Tracing disabled. Errors remain available.'
+  updateControls()
+})
+element('download-diagnostics').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify({
+    ...diagnosticSnapshot(), siteCommit: environment.siteCommit, siteVersion: SITE_VERSION,
+  }, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'webusb-diagnostics.json'
+  document.body.append(link)
+  link.click()
+  link.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 30_000)
+  element('diagnostic-status').textContent = 'Diagnostic snapshot prepared. Review it before sharing.'
+})
+element('clear-diagnostics').addEventListener('click', () => {
+  clearDiagnostics()
+  element('diagnostic-status').textContent = 'In-page diagnostic history cleared. Clear the DevTools Console separately.'
+})
 form.addEventListener('input', updateSettings)
 form.addEventListener('change', updateSettings)
 element('preset-default').addEventListener('click', () => setPreset(10, 1, 3))
@@ -444,6 +500,7 @@ connectButton.addEventListener('click', async () => {
     setConnection('Connected', 'ADB is ready. Capability probing and free-space checks run before measurement.')
   } catch (error) {
     if (attempt !== connectionGeneration) return
+    diagnosticError('app.connect.failed', 'Connection failed. Check the phone authorization, cable and Windows driver.', error)
     setConnection('Disconnected', 'No active device connection. Check the setup guide and reconnect when ready.')
     message('app-error', errorMessage(error))
   } finally {
@@ -465,6 +522,7 @@ disconnectButton.addEventListener('click', async () => {
     await client.disconnect()
     setConnection('Disconnected', 'Disconnected. Reconnect the same phone if cleanup is pending.')
   } catch (error) {
+    diagnosticError('app.disconnect.failed', 'Disconnect did not finish. Unplug the phone before reconnecting.', error)
     message('app-error', errorMessage(error))
   } finally {
     disconnecting = false
@@ -482,6 +540,7 @@ cleanupButton.addEventListener('click', async () => {
     await client.cleanupLeftovers()
     setConnection('Connected', 'Recorded test files for this phone were cleaned up.')
   } catch (error) {
+    diagnosticError('app.cleanup.failed', 'Cleanup did not finish. Reconnect the same phone before retrying.', error)
     message('app-error', `Cleanup did not finish: ${errorMessage(error)}`)
     setConnection(client.connected ? 'Connected' : 'Disconnected', 'Cleanup records were retained. Reconnect the same phone and retry scoped cleanup.')
   } finally {
@@ -647,6 +706,8 @@ form.addEventListener('submit', async (event) => {
     await refreshReports()
   } catch (error) {
     if (renderTimer !== undefined) clearTimeout(renderTimer)
+    diagnosticError('app.run.failed', 'Run or report finalization failed. Keep the diagnostic log and committed partial report.',
+      error, { runId: activeRunId })
     renderTimer = undefined
     lastProgress = undefined
     badge('run-badge', 'Failed · partial', 'warning')
@@ -657,7 +718,10 @@ form.addEventListener('submit', async (event) => {
       storageReady = false
       message('storage-error', errorMessage(error))
     }
-    try { await refreshReports() } catch { /* The original storage error remains visible. */ }
+    try { await refreshReports() } catch (refreshError) {
+      diagnosticError('app.reports.refresh.failed', 'Partial reports could not be refreshed. The original run error remains visible.',
+        refreshError, { runId: activeRunId })
+    }
   } finally {
     payloads?.dispose()
     running = false
@@ -755,6 +819,7 @@ async function reportAction(action: () => Promise<void>): Promise<void> {
   try {
     await action()
   } catch (error) {
+    diagnosticError('app.report.failed', 'Report operation failed. Check the visible error; no report was uploaded.', error)
     message('report-error', errorMessage(error))
     element('report-status').textContent = 'The report operation did not complete.'
   } finally {
@@ -882,8 +947,10 @@ void store.ready().then(async () => {
   await refreshReports()
   updateControls()
 }).catch((error: unknown) => {
+  diagnosticError('app.storage.failed', 'IndexedDB is unavailable. Runs are disabled; allow site storage and reload.', error)
   storageReady = false
   message('storage-error', errorMessage(error))
   element('report-status').textContent = 'Local report storage is unavailable. Runs are disabled to avoid losing evidence.'
   updateControls()
 })
+trace('app.ready', { connected: client.connected, enabled: diagnosticsEnabled() })

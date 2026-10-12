@@ -3,6 +3,7 @@ import { createInProcessPayloadService } from './payload'
 import { runWorkload } from './runner'
 import type { DeviceStorage, FileResult, PayloadService, RunnerOptions, RunSummary } from './types'
 import { DEFAULT_SETTINGS } from './workload'
+import { clearDiagnostics, diagnosticSnapshot, setDiagnosticsEnabled } from './diagnostics'
 
 class SimulatedDevice implements DeviceStorage {
   readonly info = { model: 'Simulated phone', manufacturer: 'Test only', features: ['simulated'], maxPayloadSize: 65536 }
@@ -82,9 +83,41 @@ function fixture(overrides: Partial<RunnerOptions['settings']> = {}) {
   return { device, controller, records, starts, options }
 }
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  setDiagnosticsEnabled(false)
+  clearDiagnostics()
+  vi.restoreAllMocks()
+})
 
 describe('runner with simulated device storage (not hardware coverage)', () => {
+  it('marks diagnostic runs and records phase, file, and completion context without user input', async () => {
+    setDiagnosticsEnabled(true)
+    clearDiagnostics()
+    const { options } = fixture({ fileCount: 1, rounds: 1, seed: 'private-seed', notes: 'private-notes', buildLabel: 'private-label' })
+    const summary = await runWorkload(options)
+    expect(summary.environment.diagnosticsEnabled).toBe(true)
+    const log = diagnosticSnapshot()
+    expect(log.entries).toContainEqual(expect.objectContaining({
+      event: 'run.phase.start', context: expect.objectContaining({ runId: summary.id, phase: 'upload', round: 1, index: 1 }),
+    }))
+    expect(log.entries).toContainEqual(expect.objectContaining({
+      event: 'run.file.verified', context: { runId: summary.id, round: 1, index: 1, bytes: 8 },
+    }))
+    expect(log.entries.at(-1)).toMatchObject({ event: 'run.end', context: { status: 'completed', files: 1 } })
+    expect(JSON.stringify(log)).not.toMatch(/private-seed|private-notes|private-label|Simulated phone/)
+  })
+
+  it('logs failed run phase and file context with tracing disabled', async () => {
+    clearDiagnostics()
+    const { options, device } = fixture({ fileCount: 1, rounds: 1 })
+    device.fail = 'read:r000001-f001.bin'
+    const summary = await runWorkload(options)
+    expect(summary.environment.diagnosticsEnabled).toBe(false)
+    expect(diagnosticSnapshot().entries).toContainEqual(expect.objectContaining({
+      event: 'run.failed', context: expect.objectContaining({ runId: summary.id, phase: 'download', round: 1, index: 1 }),
+    }))
+  })
+
   it.each(['round-trip', 'batch'] as const)('performs real independent receive verification in %s order for every round', async (pattern) => {
     const { device, records, starts, options } = fixture({ pattern })
     const summary = await runWorkload(options)

@@ -1,5 +1,6 @@
 import type { PayloadService } from './types'
 import { generatePayloadBytes, hashPayload } from './workload'
+import { diagnosticError } from './diagnostics'
 
 export type PayloadRequest =
   | { id: number; operation: 'prepare'; size: number; seed: string; index: number }
@@ -12,7 +13,7 @@ export type PayloadReply =
 
 export function createPayloadService(): PayloadService {
   const worker = new Worker(new URL('./payload.worker.ts', import.meta.url), { type: 'module' })
-  const pending = new Map<number, { resolve(value: PayloadReply): void; reject(error: Error): void }>()
+  const pending = new Map<number, { operation: PayloadRequest['operation']; resolve(value: PayloadReply): void; reject(error: Error): void }>()
   let nextId = 0
   let disposed = false
 
@@ -29,23 +30,35 @@ export function createPayloadService(): PayloadService {
     const request = pending.get(reply.id)
     if (!request) return
     pending.delete(reply.id)
-    if ('error' in reply) request.reject(new Error(reply.error))
-    else request.resolve(reply)
+    if ('error' in reply) {
+      const error = new Error(reply.error)
+      diagnosticError('worker.operation.failed', 'Payload generation or hashing failed. The run cannot continue.',
+        error, { operation: request.operation })
+      request.reject(error)
+    } else request.resolve(reply)
   }
   worker.onerror = (event) => {
     event.preventDefault()
-    stop(new Error(`Payload worker failed: ${event.message}`))
+    const error = new Error(`Payload worker failed: ${event.message}`, { cause: event.error })
+    diagnosticError('worker.failed', 'The payload worker failed. Reload before another run.', error, { pending: pending.size })
+    stop(error)
   }
-  worker.onmessageerror = () => stop(new Error('Payload worker response could not be decoded.'))
+  worker.onmessageerror = () => {
+    const error = new Error('Payload worker response could not be decoded.')
+    diagnosticError('worker.message.failed', 'Worker communication failed. Reload before another run.', error)
+    stop(error)
+  }
 
   function request(message: PayloadRequest, transfers: Transferable[] = []): Promise<PayloadReply> {
     if (disposed) return Promise.reject(new Error('Payload service disposed.'))
     return new Promise((resolve, reject) => {
-      pending.set(message.id, { resolve, reject })
+      pending.set(message.id, { operation: message.operation, resolve, reject })
       try {
         worker.postMessage(message, transfers)
       } catch (error) {
         pending.delete(message.id)
+        diagnosticError('worker.send.failed', 'The payload request could not reach the worker. The run cannot continue.',
+          error, { operation: message.operation })
         reject(error)
       }
     })

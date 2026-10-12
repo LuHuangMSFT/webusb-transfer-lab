@@ -1,5 +1,6 @@
 import type { DeviceStorage, FileResult, Phase, RunnerOptions, RunSummary } from './types'
 import { estimateWorkload, validateSettings } from './workload'
+import { diagnosticError, diagnosticsEnabled, trace } from './diagnostics'
 
 const activeDevices = new WeakSet<DeviceStorage>()
 const SETTLEMENT_TIMEOUT_MS = 1000
@@ -34,6 +35,7 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
       siteVersion: options.environment.siteVersion,
       browser: options.environment.browser,
       dependencies: Object.freeze({ ...options.environment.dependencies }),
+      diagnosticsEnabled: diagnosticsEnabled(),
     }),
     startedAt: new Date().toISOString(),
     completedAt: '',
@@ -60,6 +62,7 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   let lastProgress = -Infinity
   let round = 0
   let file = 0
+  let currentPhase: Phase | 'persist' | 'start' = 'start'
   let rejectCanceled!: (error: Error) => void
   const canceled = new Promise<never>((_, reject) => { rejectCanceled = reject })
   void canceled.catch(() => {})
@@ -67,8 +70,13 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   function abort(): void {
     if (invalidated) return
     invalidated = true
-    try { device.abort() } catch { /* The session must still never be reused. */ }
-    try { payloads.dispose() } catch { /* Rejection below still stops the runner. */ }
+    trace('run.cancel', { runId: summary.id, phase: currentPhase, round, index: file, pending: outstanding.size })
+    try { device.abort() } catch (error) {
+      diagnosticError('run.abort.failed', 'USB teardown failed. Unplug the phone before reconnecting.', error, { runId: summary.id })
+    }
+    try { payloads.dispose() } catch (error) {
+      diagnosticError('run.worker.dispose.failed', 'Worker teardown failed. Reload before another run.', error, { runId: summary.id })
+    }
     rejectCanceled(new Error('Run canceled. Connection invalidated; reconnect before cleanup.'))
   }
   signal.addEventListener('abort', abort, { once: true })
@@ -100,11 +108,17 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   }
 
   async function timed<T>(phase: Phase, action: () => Promise<T>, target?: FileResult): Promise<T> {
+    currentPhase = phase
+    const context = { runId: summary.id, phase, round, index: file }
+    trace('run.phase.start', context)
+    let status = 'failed'
     const label = `${summary.id}:${phase}`
     const start = performance.now()
     performance.mark(`${label}:start`)
     try {
-      return await action()
+      const value = await action()
+      status = 'completed'
+      return value
     } finally {
       const elapsed = Math.max(0, performance.now() - start)
       const key = `${phase}Ms` as keyof RunSummary['totals']
@@ -115,6 +129,7 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
       performance.clearMarks(`${label}:start`)
       performance.clearMarks(`${label}:end`)
       performance.clearMeasures(label)
+      trace('run.phase.end', { ...context, status, durationMs: elapsed })
     }
   }
 
@@ -133,6 +148,7 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   }
 
   async function persist(active: ActiveFile): Promise<void> {
+    currentPhase = 'persist'
     active.persistenceAttempted = true
     try {
       const snapshot = Object.freeze({ ...active.result })
@@ -141,8 +157,8 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
       await track(() => options.onFile(snapshot))
     } catch (error) {
       persistenceFailed = true
-      if (invalidated) throw new Error(`Result persistence interrupted: ${errorMessage(error)}`)
-      throw new Error(`Result persistence failed: ${errorMessage(error)}`)
+      if (invalidated) throw new Error(`Result persistence interrupted: ${errorMessage(error)}`, { cause: error })
+      throw new Error(`Result persistence failed: ${errorMessage(error)}`, { cause: error })
     }
   }
 
@@ -206,6 +222,7 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
     result.passed = true
     await persist(active)
     summary.completedFiles++
+    trace('run.file.verified', { runId: summary.id, round: result.round, index: result.index, bytes: result.bytes })
     activeFiles.shift()
     current = undefined
   }
@@ -219,6 +236,8 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   }
 
   try {
+    trace('run.start', { runId: summary.id, fileCount: settings.fileCount, rounds: settings.rounds,
+      bytes: settings.fileSizeBytes, operation: settings.pattern, enabled: summary.environment.diagnosticsEnabled })
     // Give persistence a detached initial snapshot before touching device storage.
     await operation(() => options.onStart({
       ...summary, totals: { ...summary.totals }, leftovers: [],
@@ -274,12 +293,18 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
   } catch (error) {
     summary.status = invalidated || signal.aborted ? 'canceled' : 'failed'
     summary.error = errorMessage(error)
+    if (summary.status !== 'canceled') {
+      diagnosticError('run.failed', 'Run stopped. Keep the partial report and review scoped cleanup before retrying.',
+        error, { runId: summary.id, phase: currentPhase, round, index: file, files: filesOnDevice.size })
+    }
     if (current) {
       current.result.passed = false
       current.result.error = summary.error
     }
     if (runCreated && !cleanupAttempted && !invalidated && device.connected) {
       try { await cleanupRun() } catch (cleanupError) {
+        diagnosticError('run.cleanup.failed', 'Cleanup is incomplete. Reconnect the same phone and retry scoped cleanup.',
+          cleanupError, { runId: summary.id, files: filesOnDevice.size })
         summary.error += ` Cleanup failed: ${errorMessage(cleanupError)}`
       }
     }
@@ -289,6 +314,8 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
       active.result.passed = false
       active.result.error ??= `Not verified; run stopped: ${summary.error}`
       try { await persist(active) } catch (persistenceError) {
+        diagnosticError('run.persist.failed', 'Partial results could not be saved. Retain diagnostics before reloading.',
+          persistenceError, { runId: summary.id, round: active.result.round, index: active.result.index })
         summary.error += ` ${errorMessage(persistenceError)}`
       }
     }
@@ -300,6 +327,8 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
         summary.error = `${summary.error ?? 'Run canceled.'} Connection invalidated; reconnect before cleanup.`
       }
       try { await bounded(Promise.allSettled([...outstanding])) } catch (error) {
+        diagnosticError('run.settlement.failed', 'Pending work did not settle after Stop. Unplug the phone before retrying.',
+          error, { runId: summary.id, pending: outstanding.size })
         summary.error += ` ${errorMessage(error)}`
       }
     }
@@ -307,6 +336,8 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
     if ((runCreated || creationAttempted) && !summary.leftovers.length) summary.leftovers.push(`${summary.id}/`)
     summary.completedAt = new Date().toISOString()
     summary.totals.wallMs = Math.max(0, performance.now() - wallStart)
+    trace('run.end', { runId: summary.id, status: summary.status, files: summary.completedFiles,
+      pending: summary.leftovers.length, durationMs: summary.totals.wallMs })
     activeDevices.delete(device)
   }
   return summary

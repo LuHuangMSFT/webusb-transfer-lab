@@ -3,6 +3,8 @@ import type { AdbCredentialStore, AdbPrivateKey, AdbSync, AdbSyncStat } from '@y
 import { AdbDaemonWebUsbDeviceManager } from '@yume-chan/adb-daemon-webusb'
 import { ReadableStream } from '@yume-chan/stream-extra'
 import type { DeviceInfo, DeviceStorage } from './types'
+import { diagnosticError, diagnosticsEnabled, trace } from './diagnostics'
+import type { DiagnosticContext } from './diagnostics'
 
 const ROOT = '/data/local/tmp'
 const PREFIX = `${ROOT}/webusb-transfer-lab-`
@@ -14,6 +16,7 @@ const HEADROOM = 64 * 1024 * 1024
 const IO_TIMEOUT = 120_000
 const SHELL_TIMEOUT = 15_000
 const CLOSE_TIMEOUT = 10_000
+let nextSession = 0
 
 interface DirectoryIdentity {
   dev: string
@@ -30,7 +33,10 @@ interface Ownership {
 }
 
 interface Session {
+  id: number
+  context?: DiagnosticContext
   active: boolean
+  expectedCancellation?: boolean
   cancellation: AbortController
   usb?: USBDevice
   adb?: Adb
@@ -60,6 +66,11 @@ function requireSize(value: number): void {
   if (!Number.isSafeInteger(value) || value < 1 || value > MAX_FILE) {
     throw new Error('File size must be between 1 byte and 16 MiB.')
   }
+}
+
+function fileContext(name: string): DiagnosticContext {
+  const match = FILE.exec(name)
+  return match ? { round: Number(match[1]), index: Number(match[2]) } : { phase: 'probe' }
 }
 
 function displayName(value: string | null | undefined): string {
@@ -169,10 +180,11 @@ export class AdbClient implements DeviceStorage {
     if (!globalThis.isSecureContext || !globalThis.navigator?.usb) {
       throw new Error('WebUSB requires HTTPS and a compatible Chromium browser.')
     }
-    const session: Session = { active: true, cancellation: new AbortController() }
+    const session: Session = { id: ++nextSession, active: true, cancellation: new AbortController() }
     this.#session = session
     this.#lastError = undefined
     let phase: 'selection' | 'interface' | 'authorization' | 'sync' = 'selection'
+    trace('adb.connect.start', { session: session.id })
     try {
       const manager = new AdbDaemonWebUsbDeviceManager(navigator.usb)
       // Invoke the chooser before the first await, retaining the button's activation.
@@ -218,11 +230,24 @@ export class AdbClient implements DeviceStorage {
       const adb = new Adb(transport)
       session.adb = adb
       void adb.disconnected.then(
-        () => this.#invalidate(session, new Error('The phone disconnected. Reconnect to clean up leftover test files.')),
-        () => this.#invalidate(session, new Error('The USB connection failed. Reconnect to clean up leftover test files.')),
+        () => {
+          if (!session.active) return
+          const failure = new Error('The phone disconnected. Reconnect to clean up leftover test files.')
+          diagnosticError('adb.disconnected', 'Reconnect the same phone for scoped cleanup.', failure, { ...session.context, session: session.id })
+          this.#invalidate(session, failure)
+        },
+        (error: unknown) => {
+          if (!session.active) return
+          const failure = new Error('The USB connection failed. Reconnect to clean up leftover test files.', { cause: error })
+          diagnosticError('adb.disconnected', 'The USB connection failed. Reconnect the same phone for scoped cleanup.', failure, { ...session.context, session: session.id })
+          this.#invalidate(session, failure)
+        },
       )
       if (!adb.subprocess.shellProtocol?.isSupported) {
-        throw new Error('This phone requires ADB shell_v2 support for reliable storage checks.')
+        const failure = new Error('This phone requires ADB shell_v2 support for reliable storage checks.')
+        diagnosticError('adb.capability.missing', 'This phone must support shell_v2 for reliable storage checks.', failure,
+          { session: session.id, operation: 'shell_v2' })
+        throw failure
       }
       phase = 'sync'
       session.sync = await this.#wait(session, 'ADB SYNC connection', async () => {
@@ -234,7 +259,10 @@ export class AdbClient implements DeviceStorage {
         return sync
       }, SHELL_TIMEOUT)
       if (!session.sync.supportsStat) {
-        throw new Error('This phone requires ADB stat_v2 support for safe file ownership checks.')
+        const failure = new Error('This phone requires ADB stat_v2 support for safe file ownership checks.')
+        diagnosticError('adb.capability.missing', 'This phone must support stat_v2 for safe file ownership checks.', failure,
+          { session: session.id, operation: 'stat_v2' })
+        throw failure
       }
       this.#info = {
         model: displayName(adb.banner.model ?? device.raw.productName),
@@ -242,6 +270,7 @@ export class AdbClient implements DeviceStorage {
         features: adb.deviceFeatures.filter((feature) => adb.clientFeatures.includes(feature)),
         maxPayloadSize: adb.maxPayloadSize,
       }
+      trace('adb.connect.ready', { session: session.id, maxPayloadSize: adb.maxPayloadSize })
     } catch (error) {
       const messages = {
         selection: 'USB device selection failed or permission was denied. Select an Android ADB interface.',
@@ -253,19 +282,20 @@ export class AdbClient implements DeviceStorage {
         ? session.cancellation.signal.reason as Error
         : new Error(error instanceof Error && /^(This phone|The device has no|Device selection canceled)/.test(error.message)
             ? error.message
-            : messages[phase])
+            : messages[phase], { cause: error })
+      if (!session.expectedCancellation) diagnosticError('adb.connect.failed', messages[phase], failure, { session: session.id, phase })
       this.#invalidate(session, failure)
       throw failure
     }
   }
 
   abort(): void {
-    if (this.#session) this.#invalidate(this.#session, new Error('Transfer canceled; the USB connection is no longer reusable. Reconnect for cleanup.'))
+    if (this.#session) this.#invalidate(this.#session, new Error('Transfer canceled; the USB connection is no longer reusable. Reconnect for cleanup.'), true)
   }
 
   async disconnect(): Promise<void> {
     const session = this.#session
-    if (session) this.#invalidate(session, new Error('Disconnected. Reconnect to clean up any leftover test files.'))
+    if (session) this.#invalidate(session, new Error('Disconnected. Reconnect to clean up any leftover test files.'), true)
     const closing = this.#closing
     if (closing) await closing
     if (this.#pending.size) throw new Error('USB teardown is still pending. Unplug the phone before reconnecting.')
@@ -284,7 +314,7 @@ export class AdbClient implements DeviceStorage {
         throw new Error('Leftovers belong to a different phone. Connect that same phone; no files were removed.')
       }
       for (const record of matching) await this.#cleanup(session, record)
-    })
+    }, { operation: 'cleanup leftovers' })
   }
 
   async createRun(runId: string): Promise<void> {
@@ -314,27 +344,29 @@ export class AdbClient implements DeviceStorage {
       const returned = await this.#read(session, record, 'probe.bin', probe.byteLength)
       if (returned.some((byte, index) => byte !== probe[index])) throw new Error('Phone storage capability probe returned corrupted data.')
       await this.#remove(session, record, 'probe.bin')
-    })
+    }, { operation: 'create run', runId })
   }
 
   async checkSpace(peakBytes: number): Promise<void> {
     if (!Number.isSafeInteger(peakBytes) || peakBytes < 1 || peakBytes > 1024 * 1024 * 1024) {
       throw new Error('Invalid peak storage requirement.')
     }
-    await this.#operate((session) => this.#space(session, peakBytes))
+    await this.#operate((session) => this.#space(session, peakBytes), { operation: 'check space', bytes: peakBytes })
   }
 
   async writeFile(runId: string, name: string, data: Uint8Array<ArrayBuffer>): Promise<void> {
     requireName(name)
     if (!(data instanceof Uint8Array)) throw new Error('Expected a binary file payload.')
     requireSize(data.byteLength)
-    await this.#operate((session) => this.#write(session, this.#owned(session, runId), name, data))
+    await this.#operate((session) => this.#write(session, this.#owned(session, runId), name, data),
+      { operation: 'write file', runId, bytes: data.byteLength, ...fileContext(name) })
   }
 
   async readFile(runId: string, name: string, expectedBytes: number): Promise<Uint8Array<ArrayBuffer>> {
     requireName(name)
     requireSize(expectedBytes)
-    return this.#operate((session) => this.#read(session, this.#owned(session, runId), name, expectedBytes))
+    return this.#operate((session) => this.#read(session, this.#owned(session, runId), name, expectedBytes),
+      { operation: 'read file', runId, bytes: expectedBytes, ...fileContext(name) })
   }
 
   async statFile(runId: string, name: string): Promise<number> {
@@ -343,12 +375,13 @@ export class AdbClient implements DeviceStorage {
       const record = this.#owned(session, runId)
       await this.#directory(session, record)
       return this.#size(await this.#file(session, record, name))
-    })
+    }, { operation: 'stat file', runId, ...fileContext(name) })
   }
 
   async removeFile(runId: string, name: string): Promise<void> {
     requireName(name)
-    await this.#operate((session) => this.#remove(session, this.#owned(session, runId), name))
+    await this.#operate((session) => this.#remove(session, this.#owned(session, runId), name),
+      { operation: 'remove file', runId, ...fileContext(name) })
   }
 
   async cleanupRun(runId: string): Promise<void> {
@@ -356,20 +389,30 @@ export class AdbClient implements DeviceStorage {
     await this.#operate(async (session) => {
       const record = this.#load().find((item) => item.runId === runId)
       if (record) await this.#cleanup(session, record)
-    })
+    }, { operation: 'cleanup run', runId })
   }
 
-  async #operate<T>(operation: (session: Session) => Promise<T>): Promise<T> {
+  async #operate<T>(operation: (session: Session) => Promise<T>, context: DiagnosticContext): Promise<T> {
     if (this.#busy) throw new Error('Concurrent storage operations are not permitted.')
     const session = this.#session
     if (!session?.active || !session.sync) throw new Error('The phone is disconnected. Reconnect before accessing test storage.')
     this.#busy = true
+    session.context = context
+    trace('adb.operation.start', { ...context, session: session.id })
     try {
       const value = await operation(session)
       this.#assert(session)
+      trace('adb.operation.completed', { ...context, session: session.id })
       return value
+    } catch (error) {
+      if (!session.expectedCancellation) {
+        diagnosticError('adb.operation.failed', 'Device operation stopped. Review the operation and error codes before retrying.',
+          error, { ...context, session: session.id })
+      }
+      throw error
     } finally {
       this.#busy = false
+      session.context = undefined
     }
   }
 
@@ -381,13 +424,21 @@ export class AdbClient implements DeviceStorage {
 
   async #wait<T>(session: Session, label: string, operation: () => PromiseLike<T>, timeout = IO_TIMEOUT): Promise<T> {
     this.#assert(session)
+    const context = { ...session.context, session: session.id, operation: label }
+    const start = diagnosticsEnabled() ? performance.now() : 0
+    trace('adb.wait.start', { ...context, timeoutMs: timeout })
+    let status = 'failed'
     let timer: ReturnType<typeof setTimeout> | undefined
     let canceled: (() => void) | undefined
     const stopped = new Promise<never>((_, reject) => {
       canceled = () => reject(session.cancellation.signal.reason)
       session.cancellation.signal.addEventListener('abort', canceled, { once: true })
-      timer = setTimeout(() => this.#invalidate(session,
-        new Error(`${label} timed out. USB was invalidated; reconnect before retrying.`)), timeout)
+      timer = setTimeout(() => {
+        const failure = new Error(`${label} timed out. USB was invalidated; reconnect before retrying.`)
+        diagnosticError('adb.timeout', 'Operation timed out. Reconnect; unplug the cable if teardown also stalls.',
+          failure, { ...context, timeoutMs: timeout, pending: this.#pending.size })
+        this.#invalidate(session, failure)
+      }, timeout)
     })
     const work = Promise.resolve().then(() => {
       this.#assert(session)
@@ -398,30 +449,38 @@ export class AdbClient implements DeviceStorage {
     try {
       const value = await Promise.race([work, stopped])
       this.#assert(session)
+      status = 'completed'
       return value
+    } catch (error) {
+      if (error instanceof Error && error.message === 'ENOENT') status = 'missing'
+      throw error
     } finally {
       clearTimeout(timer)
       if (canceled) session.cancellation.signal.removeEventListener('abort', canceled)
+      if (diagnosticsEnabled()) trace('adb.wait.end', { ...context, status, durationMs: performance.now() - start })
     }
   }
 
-  #invalidate(session: Session, reason: Error): void {
+  #invalidate(session: Session, reason: Error, expectedCancellation = false): void {
     if (!session.active) return
+    trace('adb.session.invalidated', { ...session.context, session: session.id, pending: this.#pending.size })
     session.active = false
+    session.expectedCancellation = expectedCancellation
     this.#lastError = reason.message
     session.cancellation.abort(reason)
     if (this.#session === session) this.#session = undefined
     // SYNC read cancellation drains rather than aborts. Close the actual USB
     // device immediately, including during authentication, to stop pending I/O.
-    const close = async (operation: () => PromiseLike<unknown> | unknown): Promise<void> => {
-      try { await operation() } catch {
+    const close = async (label: string, operation: () => PromiseLike<unknown> | unknown): Promise<void> => {
+      try { await operation() } catch (error) {
         this.#lastError = 'USB teardown reported an error. Unplug the phone before reconnecting.'
+        diagnosticError('adb.teardown.failed', 'Unplug the phone before reconnecting.', error, { session: session.id, operation: label })
       }
     }
     const tasks = Promise.all([
-      close(() => session.usb?.close()),
-      close(() => session.sync?.dispose()),
-      close(() => session.adb?.close()),
+      close('USB close', () => session.usb?.close()),
+      close('SYNC dispose', () => session.sync?.dispose()),
+      close('ADB close', () => session.adb?.close()),
     ])
     this.#pending.add(tasks)
     void tasks.then(() => this.#pending.delete(tasks), () => this.#pending.delete(tasks))
@@ -429,23 +488,28 @@ export class AdbClient implements DeviceStorage {
     const timeout = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
         this.#lastError = 'USB teardown timed out. Unplug the phone before reconnecting.'
+        diagnosticError('adb.teardown.timeout', 'Unplug the phone before reconnecting.', new Error(this.#lastError),
+          { session: session.id, timeoutMs: CLOSE_TIMEOUT, pending: this.#pending.size })
         resolve()
       }, CLOSE_TIMEOUT)
     })
     const closing = Promise.race([tasks, timeout]).then(() => { clearTimeout(timer) })
     this.#closing = closing
     void closing.then(() => {
+      trace('adb.teardown.settled', { session: session.id, pending: this.#pending.size })
       if (this.#closing === closing) this.#closing = undefined
     })
-    try { this.#onDisconnect?.() } catch {
+    try { this.#onDisconnect?.() } catch (error) {
       this.#lastError = 'The disconnect notification failed; the USB session has still been invalidated.'
+      diagnosticError('adb.notification.failed', 'The session is invalidated, but the UI notification failed. Reload before another run.',
+        error, { session: session.id })
     }
   }
 
   #load(): Ownership[] {
     let text: string | null
-    try { text = localStorage.getItem(STORAGE_KEY) } catch {
-      throw new Error('Local cleanup ownership storage is unavailable. No test files will be written.')
+    try { text = localStorage.getItem(STORAGE_KEY) } catch (error) {
+      throw new Error('Local cleanup ownership storage is unavailable. No test files will be written.', { cause: error })
     }
     if (text === null) return []
     try {
@@ -455,8 +519,8 @@ export class AdbClient implements DeviceStorage {
         || new Set(value.map((record) => record.runId)).size !== value.length
         || new Set(value.map((record) => record.directoryId)).size !== value.length) throw new Error()
       return value
-    } catch {
-      throw new Error('Saved cleanup ownership is malformed. Refusing to use or overwrite unsafe records.')
+    } catch (error) {
+      throw new Error('Saved cleanup ownership is malformed. Refusing to use or overwrite unsafe records.', { cause: error })
     }
   }
 
@@ -476,8 +540,8 @@ export class AdbClient implements DeviceStorage {
     try {
       localStorage.setItem(STORAGE_KEY, text)
       if (localStorage.getItem(STORAGE_KEY) !== text) throw new Error()
-    } catch {
-      throw new Error('Could not persist cleanup ownership. No further test files will be written.')
+    } catch (error) {
+      throw new Error('Could not persist cleanup ownership. No further test files will be written.', { cause: error })
     }
   }
 
@@ -514,7 +578,7 @@ export class AdbClient implements DeviceStorage {
     } catch (error) {
       this.#assert(session)
       if (error instanceof Error && error.message === 'ENOENT') return undefined
-      throw new Error('Cannot inspect test storage: permission denied or ADB metadata failure.')
+      throw new Error('Cannot inspect test storage: permission denied or ADB metadata failure.', { cause: error })
     }
   }
 
@@ -560,15 +624,17 @@ export class AdbClient implements DeviceStorage {
   async #space(session: Session, peakBytes: number): Promise<void> {
     await this.#parents(session)
     const result = await this.#shell(session, ['df', '-kP', ROOT], 'Phone storage check')
-    if (parseAvailableBytes(result) < peakBytes + HEADROOM) {
+    const available = parseAvailableBytes(result)
+    trace('adb.space.available', { session: session.id, bytes: peakBytes + HEADROOM, actualBytes: available })
+    if (available < peakBytes + HEADROOM) {
       throw new Error('Insufficient phone storage: the workload plus 64 MiB headroom is required.')
     }
   }
 
   async #shell(session: Session, command: string[], label: string): Promise<string> {
     return this.#wait(session, label, async () => {
-      const process = await session.adb!.subprocess.shellProtocol!.spawn(command).catch(() => {
-        const failure = new Error(`${label} failed: ADB shell connection was lost.`)
+      const process = await session.adb!.subprocess.shellProtocol!.spawn(command).catch((error: unknown) => {
+        const failure = new Error(`${label} failed: ADB shell connection was lost.`, { cause: error })
         this.#invalidate(session, failure)
         throw failure
       })
@@ -600,18 +666,23 @@ export class AdbClient implements DeviceStorage {
           collect(process.stdout), collect(process.stderr), process.exited,
         ])
         this.#assert(session)
-        if (status !== 0 || stderr.trim()) throw new Error(`${label} failed: storage permission, access, or device command failure.`)
+        if (status !== 0 || stderr.trim()) {
+          const failure = new Error(`${label} failed: storage permission, access, or device command failure.`, { cause: new Error(stderr) })
+          diagnosticError('adb.command.failed', 'Device command failed. No alternate storage or recursive cleanup will be used.',
+            failure, { ...session.context, session: session.id, operation: label, exitCode: status })
+          throw failure
+        }
         return stdout
       } catch (error) {
         // A failed or oversized shell stream must not leave ADB backpressured.
         const failure = error instanceof Error
           && (error.message === 'Unexpectedly large shell response.' || error.message.startsWith(`${label} failed:`))
-          ? error : new Error(`${label} failed: ADB shell I/O error.`)
+          ? error : new Error(`${label} failed: ADB shell I/O error.`, { cause: error })
         this.#invalidate(session, failure)
         throw failure
       } finally {
-        try { await process.kill() } catch {
-          const failure = new Error(`${label} failed: ADB shell did not close cleanly.`)
+        try { await process.kill() } catch (error) {
+          const failure = new Error(`${label} failed: ADB shell did not close cleanly.`, { cause: error })
           this.#invalidate(session, failure)
           throw failure
         }
@@ -639,9 +710,10 @@ export class AdbClient implements DeviceStorage {
         filename: path, file, type: LinuxFileType.File, permission: 0o600, dryRun: false,
       }))
     } catch (error) {
-      this.#invalidate(session, new Error('Phone file upload failed; reconnect for scoped cleanup.'))
-      throw error instanceof Error && session.cancellation.signal.reason !== error
-        ? new Error('Phone file upload failed; reconnect for scoped cleanup.') : error
+      const failure = error instanceof Error && session.cancellation.signal.reason === error ? error
+        : new Error('Phone file upload failed; reconnect for scoped cleanup.', { cause: error })
+      this.#invalidate(session, failure)
+      throw failure
     }
     const actual = this.#size(await this.#file(session, record, name))
     if (actual !== data.byteLength) throw new Error('Phone file size does not match the uploaded byte count.')
@@ -671,7 +743,11 @@ export class AdbClient implements DeviceStorage {
         }
       } catch (error) {
         const failure = error instanceof Error && /download (was truncated|exceeded)/.test(error.message)
-          ? error : new Error('Phone file download failed; reconnect for scoped cleanup.')
+          ? error : new Error('Phone file download failed; reconnect for scoped cleanup.', { cause: error })
+        if (!session.expectedCancellation) {
+          diagnosticError('adb.download.failed', 'Download failed. Partial received bytes are diagnostic only; reconnect for scoped cleanup.',
+            failure, { ...session.context, session: session.id, bytes: expected, actualBytes: offset })
+        }
         this.#invalidate(session, failure)
         throw failure
       } finally {

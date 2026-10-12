@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { readFile } from 'node:fs/promises'
 import type { RunReport } from '../src/types'
 
 function simulatedReport(withFix = false): RunReport {
@@ -153,4 +154,69 @@ test('development CSS works without weakening the production content policy', as
   expect(violations).toEqual([])
   await page.goto('./')
   expect(await page.locator('meta[http-equiv="Content-Security-Policy"]').getAttribute('content')).not.toContain("'unsafe-inline'")
+})
+
+test('diagnostics default to quiet and export sanitized native errors without enabling tracing', async ({ page }) => {
+  const messages: string[] = []
+  page.on('console', (message) => { if (message.text().startsWith('[WebUSB Lab]')) messages.push(message.text()) })
+  await page.addInitScript(() => Object.defineProperty(navigator, 'usb', {
+    configurable: true, value: {
+      addEventListener() {}, removeEventListener() {},
+      async getDevices() { return [] },
+      async requestDevice() { throw new DOMException('private-device-serial private-key private-payload', 'NetworkError') },
+    },
+  }))
+  await page.goto('./')
+  await expect(page.locator('#report-status')).not.toHaveText('Opening local report storage…')
+  await page.locator('#diagnostics summary').click()
+  await expect(page.locator('#diagnostic-tracing')).not.toBeChecked()
+  expect(messages).toEqual([])
+  await page.locator('#connect').click()
+  await expect(page.locator('#app-error')).toBeVisible()
+  expect(messages).toHaveLength(1)
+  expect(messages[0]).toContain('adb.connect.failed')
+  expect(messages[0]).toContain('NetworkError')
+  expect(messages[0]).not.toContain('private-')
+  const downloadPromise = page.waitForEvent('download')
+  await page.locator('#download-diagnostics').click()
+  const download = await downloadPromise
+  expect(download.suggestedFilename()).toBe('webusb-diagnostics.json')
+  const json = await readFile((await download.path())!, 'utf8')
+  const snapshot = JSON.parse(json)
+  expect(snapshot.enabled).toBe(false)
+  expect(snapshot.entries).toHaveLength(1)
+  expect(snapshot.entries[0].context.phase).toBe('selection')
+  expect(snapshot.siteCommit).toBeTruthy()
+  expect(json).not.toContain('private-')
+  await page.locator('#clear-diagnostics').click()
+  await expect(page.locator('#diagnostic-status')).toContainText('history cleared')
+})
+
+test('diagnostic query enables tracing with a profiling warning and locks the mode during connection', async ({ page }) => {
+  const messages: string[] = []
+  page.on('console', (message) => { if (message.text().startsWith('[WebUSB Lab]')) messages.push(message.text()) })
+  await page.addInitScript(() => Object.defineProperty(navigator, 'usb', {
+    configurable: true, value: {
+      addEventListener() {}, removeEventListener() {},
+      async getDevices() { return [] },
+      requestDevice() {
+        return new Promise((_, reject) => {
+          window.addEventListener('test-cancel-chooser', () => reject(new DOMException('Canceled', 'NotFoundError')), { once: true })
+        })
+      },
+    },
+  }))
+  await page.goto('./?diagnostics=1')
+  await page.locator('#diagnostics summary').click()
+  await expect(page.locator('#diagnostic-tracing')).toBeChecked()
+  await expect(page.locator('#diagnostic-warning')).toBeVisible()
+  expect(messages.some((message) => message.includes('app.ready'))).toBe(true)
+  await page.locator('#connect').click()
+  await expect(page.locator('#diagnostic-tracing')).toBeDisabled()
+  await expect(page.locator('#download-diagnostics')).toBeDisabled()
+  expect(messages.some((message) => message.includes('adb.wait.start'))).toBe(true)
+  await page.evaluate(() => window.dispatchEvent(new Event('test-cancel-chooser')))
+  await expect(page.locator('#connect')).toBeEnabled()
+  await page.locator('#diagnostic-tracing').uncheck()
+  await expect(page.locator('#diagnostic-warning')).toBeHidden()
 })
