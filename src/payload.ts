@@ -1,19 +1,25 @@
-import type { PayloadService } from './types'
+import type { PayloadProgress, PayloadService } from './types'
 import { generatePayloadBytes, hashPayload } from './workload'
 import { diagnosticError } from './diagnostics'
 
 export type PayloadRequest =
-  | { id: number; operation: 'prepare'; size: number; seed: string; index: number }
+  | { id: number; operation: 'prepare'; size: number; seed: string; index: number; reportProgress?: boolean }
   | { id: number; operation: 'hash'; buffer: ArrayBuffer }
 
 export type PayloadReply =
   | { id: number; operation: 'prepare'; buffer: ArrayBuffer; sha256: string }
   | { id: number; operation: 'hash'; sha256: string }
+  | { id: number; operation: 'progress'; progress: PayloadProgress }
   | { id: number; error: string }
 
 export function createPayloadService(): PayloadService {
   const worker = new Worker(new URL('./payload.worker.ts', import.meta.url), { type: 'module' })
-  const pending = new Map<number, { operation: PayloadRequest['operation']; resolve(value: PayloadReply): void; reject(error: Error): void }>()
+  const pending = new Map<number, {
+    operation: PayloadRequest['operation']
+    onProgress?: (progress: PayloadProgress) => void
+    resolve(value: PayloadReply): void
+    reject(error: Error): void
+  }>()
   let nextId = 0
   let disposed = false
 
@@ -29,6 +35,16 @@ export function createPayloadService(): PayloadService {
     const reply = event.data
     const request = pending.get(reply.id)
     if (!request) return
+    if ('operation' in reply && reply.operation === 'progress') {
+      try {
+        request.onProgress?.(reply.progress)
+      } catch (error) {
+        pending.delete(reply.id)
+        diagnosticError('worker.progress.failed', 'Payload progress handling failed. Retry preparation before running.', error)
+        request.reject(error instanceof Error ? error : new Error('Payload progress handling failed.', { cause: error }))
+      }
+      return
+    }
     pending.delete(reply.id)
     if ('error' in reply) {
       const error = new Error(reply.error)
@@ -49,10 +65,10 @@ export function createPayloadService(): PayloadService {
     stop(error)
   }
 
-  function request(message: PayloadRequest, transfers: Transferable[] = []): Promise<PayloadReply> {
+  function request(message: PayloadRequest, transfers: Transferable[] = [], onProgress?: (progress: PayloadProgress) => void): Promise<PayloadReply> {
     if (disposed) return Promise.reject(new Error('Payload service disposed.'))
     return new Promise((resolve, reject) => {
-      pending.set(message.id, { operation: message.operation, resolve, reject })
+      pending.set(message.id, { operation: message.operation, onProgress, resolve, reject })
       try {
         worker.postMessage(message, transfers)
       } catch (error) {
@@ -70,8 +86,8 @@ export function createPayloadService(): PayloadService {
   }
 
   return {
-    async prepare(size, seed, index) {
-      const reply = await request({ id: id(), operation: 'prepare', size, seed, index })
+    async prepare(size, seed, index, onProgress) {
+      const reply = await request({ id: id(), operation: 'prepare', size, seed, index, reportProgress: Boolean(onProgress) }, [], onProgress)
       if ('error' in reply || reply.operation !== 'prepare') throw new Error('Unexpected payload worker response.')
       return { bytes: new Uint8Array(reply.buffer), sha256: reply.sha256 }
     },
@@ -96,9 +112,11 @@ export function createInProcessPayloadService(): PayloadService {
     if (disposed) throw new Error('Payload service disposed.')
   }
   return {
-    async prepare(size, seed, index) {
+    async prepare(size, seed, index, onProgress) {
       check()
-      const bytes = generatePayloadBytes(size, seed, index)
+      const bytes = generatePayloadBytes(size, seed, index, onProgress
+        ? (completedBytes) => onProgress({ stage: 'generate', completedBytes, totalBytes: size }) : undefined)
+      onProgress?.({ stage: 'hash', completedBytes: size, totalBytes: size })
       const sha256 = await hashPayload(bytes)
       check()
       return { bytes, sha256 }

@@ -43,8 +43,14 @@ export interface Payload {
   sha256: string
 }
 
+export interface PayloadProgress {
+  stage: 'generate' | 'hash'
+  completedBytes: number
+  totalBytes: number
+}
+
 export interface PayloadService {
-  prepare(size: number, seed: string, index: number): Promise<Payload>
+  prepare(size: number, seed: string, index: number, onProgress?: (progress: PayloadProgress) => void): Promise<Payload>
   hash(bytes: Uint8Array<ArrayBuffer>): Promise<string>
   dispose(): void
 }
@@ -57,6 +63,7 @@ export interface Progress {
   completed: number
   total: number
   message: string
+  payload?: PayloadProgress
 }
 
 export interface FileResult {

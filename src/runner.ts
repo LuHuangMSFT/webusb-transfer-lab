@@ -1,4 +1,4 @@
-import type { DeviceStorage, FileResult, Payload, Phase, RunnerOptions, RunSummary } from './types'
+import type { DeviceStorage, FileResult, Payload, PayloadProgress, Phase, RunnerOptions, RunSummary } from './types'
 import { estimateWorkload, validateSettings } from './workload'
 import { diagnosticError, diagnosticsEnabled, trace } from './diagnostics'
 
@@ -107,12 +107,12 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
     return await Promise.race([track(action), canceled])
   }
 
-  function progress(phase: Phase, message: string, force = false): void {
+  function progress(phase: Phase, message: string, force = false, payload?: PayloadProgress): void {
     checkCanceled()
     const now = performance.now()
     if (!force && now - lastProgress < 100) return
     lastProgress = now
-    options.onProgress({ phase, round, file, completed: summary.completedFiles, total: estimate.totalFiles, message })
+    options.onProgress({ phase, round, file, completed: summary.completedFiles, total: estimate.totalFiles, message, ...(payload ? { payload } : {}) })
   }
 
   async function timed<T>(phase: Phase, action: () => Promise<T>, target?: FileResult): Promise<T> {
@@ -192,15 +192,19 @@ export async function runWorkload(options: RunnerOptions): Promise<RunSummary> {
     const result = active.result
     let payload = prepared?.take(round, result.index) ?? reused.get(result.index)
     if (!payload) {
-      progress('prepare', 'Generating one file and its expected SHA-256.')
+      progress('prepare', 'Starting file generation.', true, { stage: 'generate', completedBytes: 0, totalBytes: settings.fileSizeBytes })
       payload = await timed('prepare',
-        () => operation(() => payloads.prepare(settings.fileSizeBytes, settings.seed, result.index)), result)
+        () => operation(() => payloads.prepare(settings.fileSizeBytes, settings.seed, result.index, (update) => {
+          if (invalidated || signal.aborted) return
+          progress('prepare', update.stage === 'hash' ? 'Computing expected SHA-256.' : 'Generating file bytes.',
+            update.stage === 'hash', update)
+        })), result)
       if (settings.reuseAcrossRounds) reused.set(result.index, payload)
     }
     if (payload.bytes.byteLength !== settings.fileSizeBytes) throw new Error('Generated payload has the wrong size.')
     if (round === settings.rounds) reused.delete(result.index)
     result.expectedSha256 = payload.sha256
-    progress('upload', `Uploading ${result.name}.`)
+    progress('upload', `Uploading ${result.name}.`, true)
     checkCanceled()
     filesOnDevice.add(result.name)
     await timed('upload', () => operation(() => device.writeFile(summary.id, result.name, payload.bytes)), result)

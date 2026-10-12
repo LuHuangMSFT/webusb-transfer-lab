@@ -3,6 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type {} from './harness'
 import type { PayloadReply } from '../src/payload'
+import type { PayloadProgress } from '../src/types'
 
 for (const size of [1024, 1024 ** 3]) {
   test(`production worker generates and verifies ${size} bytes at the Pages base`, async ({ page }) => {
@@ -13,10 +14,14 @@ for (const size of [1024, 1024 ** 3]) {
     const result = await page.evaluate(async ({ url, size }) => {
       const worker = new Worker(url, { type: 'module' })
       try {
+        const progress: PayloadProgress[] = []
         const prepared = await new Promise<PayloadReply>((resolve, reject) => {
-          worker.onmessage = (event) => resolve(event.data)
+          worker.onmessage = (event: MessageEvent<PayloadReply>) => {
+            if ('operation' in event.data && event.data.operation === 'progress') progress.push(event.data.progress)
+            else resolve(event.data)
+          }
           worker.onerror = (event) => reject(new Error(event.message))
-          worker.postMessage({ id: 1, operation: 'prepare', size, seed: 'test', index: 1 })
+          worker.postMessage({ id: 1, operation: 'prepare', size, seed: 'test', index: 1, reportProgress: true })
         })
         if ('error' in prepared || prepared.operation !== 'prepare') throw new Error('Unexpected worker reply')
         const digest = await crypto.subtle.digest('SHA-256', prepared.buffer)
@@ -29,13 +34,23 @@ for (const size of [1024, 1024 ** 3]) {
           worker.onerror = (event) => reject(new Error(event.message))
           worker.postMessage({ id: 2, operation: 'hash', buffer: received.buffer }, [received.buffer])
         })
-        if ('error' in hashed) throw new Error(hashed.error)
-        return { byteLength, originalMatches: prepared.sha256 === expected, corruptionDetected: prepared.sha256 !== hashed.sha256 }
+        if ('error' in hashed || hashed.operation !== 'hash') throw new Error('Unexpected hash reply')
+        return { byteLength, originalMatches: prepared.sha256 === expected, corruptionDetected: prepared.sha256 !== hashed.sha256,
+          sha256: prepared.sha256, progress }
       } finally {
         worker.terminate()
       }
     }, { url: `/webusb-transfer-lab/assets/${filename}`, size })
-    expect(result).toEqual({ byteLength: size, originalMatches: true, corruptionDetected: true })
+    expect(result).toMatchObject({ byteLength: size, originalMatches: true, corruptionDetected: true })
+    expect(result.progress[0]).toEqual({ stage: 'generate', completedBytes: 0, totalBytes: size })
+    expect(result.progress.at(-1)).toEqual({ stage: 'hash', completedBytes: size, totalBytes: size })
+    const byteCounts = result.progress.filter((update) => update.stage === 'generate').map((update) => update.completedBytes)
+    expect(byteCounts).toEqual([...new Set(byteCounts)].sort((a, b) => a - b))
+    expect(byteCounts.at(-1)).toBe(size)
+    if (size === 1024 ** 3) {
+      expect(byteCounts.some((completed) => completed > 0 && completed < size)).toBe(true)
+      expect(result.sha256).toBe('ae2e10fef8f6f5ad247402078f1e3f0e28c0fa15fbd5b684fea91b143c9c5331')
+    }
   })
 }
 

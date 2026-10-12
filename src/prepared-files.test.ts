@@ -82,6 +82,18 @@ describe('explicit in-memory payload preparation', () => {
     expect(prepare).not.toHaveBeenCalled()
   })
 
+  it('reports current-file generation/hash stages separately from files ready', async () => {
+    const service = createInProcessPayloadService()
+    const progress = vi.fn()
+    const files = await PreparedFiles.prepare(settings, service, new AbortController().signal, progress)
+    expect(progress).toHaveBeenCalledWith(0, 6, { file: 0, stage: 'generate', completedBytes: 0, totalBytes: 8 })
+    expect(progress).toHaveBeenCalledWith(0, 6, { file: 1, stage: 'hash', completedBytes: 8, totalBytes: 8 })
+    expect(progress).toHaveBeenCalledWith(5, 6, { file: 6, stage: 'generate', completedBytes: 0, totalBytes: 8 })
+    expect(progress).toHaveBeenLastCalledWith(6, 6)
+    files.dispose()
+    service.dispose()
+  })
+
   it('rejects pre-aborted, disabled, oversized and malformed preparation', async () => {
     const service = createInProcessPayloadService()
     const prepare = vi.spyOn(service, 'prepare')

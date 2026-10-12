@@ -13,7 +13,13 @@ scope.onmessage = (event) => {
 async function handle(request: PayloadRequest): Promise<void> {
   try {
     if (request.operation === 'prepare') {
-      const bytes = generatePayloadBytes(request.size, request.seed, request.index)
+      const bytes = generatePayloadBytes(request.size, request.seed, request.index, request.reportProgress
+        ? (completedBytes) => scope.postMessage({
+          id: request.id, operation: 'progress', progress: { stage: 'generate', completedBytes, totalBytes: request.size },
+        }) : undefined)
+      if (request.reportProgress) scope.postMessage({
+        id: request.id, operation: 'progress', progress: { stage: 'hash', completedBytes: request.size, totalBytes: request.size },
+      })
       const sha256 = await hashPayload(bytes)
       scope.postMessage({ id: request.id, operation: 'prepare', buffer: bytes.buffer, sha256 }, [bytes.buffer])
     } else {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createInProcessPayloadService } from './payload'
 import { DEFAULT_SETTINGS, estimateWorkload, generatePayloadBytes, hashPayload, LIMITS, retainedPayloadBytes, validateSettings } from './workload'
 
@@ -112,6 +112,20 @@ describe('workload validation and deterministic synthetic data', () => {
     expect(generatePayloadBytes(32, 'other-seed', 1)).not.toEqual(bytes)
     expect(generatePayloadBytes(7, 'webusb-lab', 1)).toEqual(bytes.slice(0, 7))
     expect(new Set(Array.from({ length: 100 }, (_, index) => generatePayloadBytes(1, 'webusb-lab', index + 1)[0])).size).toBe(100)
+  })
+
+  it('reports monotonic bounded byte progress and preserves a pre-change cross-block hash', async () => {
+    let time = 0
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => { time += 40; return time })
+    const progress = vi.fn()
+    try {
+      const size = 8 * 1024 ** 2 + 7
+      const withProgress = generatePayloadBytes(size, 'webusb-lab', 1, progress)
+      expect(progress.mock.calls.map(([completed]) => completed)).toEqual([0, 3 * 1024 ** 2, 6 * 1024 ** 2, size])
+      expect(await hashPayload(withProgress)).toBe(await hashPayload(generatePayloadBytes(size, 'webusb-lab', 1)))
+      expect(await hashPayload(generatePayloadBytes(1048583, 'webusb-lab', 1, () => {})))
+        .toBe('5b3079c49ce3937ca083770890592099126df7b997868694bb02bec8755b7003')
+    } finally { clock.mockRestore() }
   })
 
   it('supports an explicitly in-process test service and disposal', async () => {

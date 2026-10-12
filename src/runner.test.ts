@@ -215,7 +215,26 @@ describe('runner with simulated device storage (not hardware coverage)', () => {
     expect(summary.totals.uploadedBytes / summary.totals.uploadMs).toBe(0.8)
     expect(summary.totals.downloadedBytes / summary.totals.downloadMs).toBe(0.4)
     expect(performance.getEntries().filter((entry) => entry.name.startsWith(summary.id))).toHaveLength(0)
-    expect(vi.mocked(options.onProgress).mock.calls.length).toBeLessThanOrEqual(7)
+    expect(vi.mocked(options.onProgress).mock.calls.length).toBeLessThanOrEqual(20)
+  })
+
+  it('shows byte generation and expected-hash progress without putting them in USB timers', async () => {
+    const { options } = fixture({ fileCount: 1, rounds: 1 })
+    options.payloads = createInProcessPayloadService()
+    const summary = await runWorkload(options)
+    expect(summary.status).toBe('completed')
+    const updates = vi.mocked(options.onProgress).mock.calls.map(([update]) => update)
+    expect(updates).toContainEqual(expect.objectContaining({
+      phase: 'prepare', file: 1, payload: { stage: 'generate', completedBytes: 0, totalBytes: 8 },
+    }))
+    expect(updates).toContainEqual(expect.objectContaining({
+      phase: 'prepare', file: 1, payload: { stage: 'hash', completedBytes: 8, totalBytes: 8 },
+    }))
+    expect(updates).toContainEqual(expect.objectContaining({ phase: 'upload', file: 1 }))
+    expect(updates.filter((update) => update.phase === 'upload').every((update) => !update.payload)).toBe(true)
+    expect(summary.totals.uploadMs).toBe(10)
+    expect(summary.totals.downloadMs).toBe(20)
+    options.payloads.dispose()
   })
 
   it('runs identically with or without optional bookkeeping and freezes the saved tags', async () => {

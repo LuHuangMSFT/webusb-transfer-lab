@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import type { PayloadReply, PayloadRequest } from './payload'
 import { hashPayload } from './workload'
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); vi.resetModules() })
 
 it('executes the worker handler with actual generation/SHA-256 and transferable replies', async () => {
   const replies: PayloadReply[] = []
@@ -26,4 +26,26 @@ it('executes the worker handler with actual generation/SHA-256 and transferable 
   scope.onmessage?.({ data: { id: 3, operation: 'prepare', size: 0, seed: 'seed', index: 0 } } as MessageEvent<PayloadRequest>)
   await vi.waitFor(() => expect(replies).toHaveLength(3))
   expect(replies[2]).toMatchObject({ id: 3, error: expect.stringContaining('Payload size') })
+})
+
+it('reports generation and hashing separately before transferring the completed buffer', async () => {
+  const replies: PayloadReply[] = []
+  const scope = {
+    onmessage: null as ((event: MessageEvent<PayloadRequest>) => void) | null,
+    postMessage(message: PayloadReply, transfers: Transferable[] = []) {
+      replies.push(structuredClone(message, { transfer: transfers }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  await import('./payload.worker')
+  scope.onmessage?.({ data: {
+    id: 1, operation: 'prepare', size: 32, seed: 'webusb-lab', index: 1, reportProgress: true,
+  } } as MessageEvent<PayloadRequest>)
+  await vi.waitFor(() => expect(replies).toHaveLength(4))
+  expect(replies.slice(0, 3)).toEqual([
+    { id: 1, operation: 'progress', progress: { stage: 'generate', completedBytes: 0, totalBytes: 32 } },
+    { id: 1, operation: 'progress', progress: { stage: 'generate', completedBytes: 32, totalBytes: 32 } },
+    { id: 1, operation: 'progress', progress: { stage: 'hash', completedBytes: 32, totalBytes: 32 } },
+  ])
+  expect(replies[3]).toMatchObject({ id: 1, operation: 'prepare', sha256: 'ff2af7ef52f4400146fe08774a5e49e3912180591336f5787a1aa3c05197777e' })
 })

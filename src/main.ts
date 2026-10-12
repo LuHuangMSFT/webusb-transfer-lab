@@ -9,7 +9,7 @@ import {
   aggregateResults, compareSummaries, MAX_IMPORT_BYTES, parseReportJson, reportLabel, ReportStore,
 } from './results'
 import type { RunStatistics } from './results'
-import type { Environment, FileResult, PayloadService, Progress, RunSummary, Settings } from './types'
+import type { Environment, FileResult, PayloadProgress, PayloadService, Progress, RunSummary, Settings } from './types'
 import { clearDiagnostics, diagnosticError, diagnosticSnapshot, diagnosticsEnabled, setDiagnosticsEnabled, trace } from './diagnostics'
 
 setDiagnosticsEnabled(new URLSearchParams(location.search).get('diagnostics') === '1')
@@ -170,8 +170,15 @@ app.innerHTML = `
               <button id="cancel-preparation" type="button" disabled>Cancel preparation</button>
               <button id="discard-prepared" type="button" disabled>Discard prepared files</button>
             </div>
-            <p id="preparation-status" class="hint" role="status">No prepared files. Prepare before starting your recording.</p>
-            <label class="sr-only" for="preparation-progress">File preparation progress</label>
+            <div class="preparation-heading"><span id="preparation-active" class="work-indicator" aria-hidden="true" hidden></span><p id="preparation-status" class="hint" role="status">No prepared files. Prepare before starting your recording.</p></div>
+            <p id="preparation-elapsed" class="hint" hidden></p>
+            <div id="preparation-current" hidden>
+              <p id="preparation-detail" class="hint"></p>
+              <label class="sr-only" for="preparation-file-progress">Current file generation progress</label>
+              <progress id="preparation-file-progress" aria-describedby="preparation-detail"></progress>
+            </div>
+            <p id="preparation-count" class="hint">Files ready: 0</p>
+            <label class="sr-only" for="preparation-progress">Files generated and hashed</label>
             <progress id="preparation-progress" value="0" max="1"></progress>
           </div>
           <div class="run-actions"><button id="start" type="submit" class="primary" disabled>Start verified run</button><button id="stop" type="button" class="danger-outline" disabled>Stop run</button></div>
@@ -196,6 +203,11 @@ app.innerHTML = `
     <section id="live" class="panel" aria-labelledby="live-title">
       <div class="section-heading"><div><p class="eyebrow">03 / OBSERVE</p><h2 id="live-title">Transfer & integrity</h2></div><span id="run-badge" class="badge">Ready when you are</span></div>
       <p id="progress-description">No run yet. Files are generated locally and deleted from the phone after verification.</p>
+      <div id="live-payload" hidden>
+        <p id="live-payload-detail" class="hint"></p>
+        <label class="sr-only" for="live-payload-progress">Current file generation progress</label>
+        <progress id="live-payload-progress" aria-describedby="live-payload-detail"></progress>
+      </div>
       <label class="sr-only" for="run-progress">Verified file progress</label><progress id="run-progress" value="0" max="1" aria-describedby="progress-description"></progress>
       <p id="progress-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
       <div class="metrics">
@@ -259,6 +271,7 @@ const prepareButton = element<HTMLButtonElement>('prepare-files')
 const cancelPreparationButton = element<HTMLButtonElement>('cancel-preparation')
 const discardPreparedButton = element<HTMLButtonElement>('discard-prepared')
 const preparationProgress = element<HTMLProgressElement>('preparation-progress')
+const preparationFileProgress = element<HTMLProgressElement>('preparation-file-progress')
 const connectButton = element<HTMLButtonElement>('connect')
 const disconnectButton = element<HTMLButtonElement>('disconnect')
 const cleanupButton = element<HTMLButtonElement>('cleanup-leftovers')
@@ -331,6 +344,18 @@ function duration(value: number | null): string {
 
 function rate(count: number, milliseconds: number): string {
   return milliseconds > 0 ? `${(count / 1048576 / (milliseconds / 1000)).toLocaleString(undefined, { maximumFractionDigits: 2 })} MiB/s` : '—'
+}
+
+function renderPayloadProgress(progress: PayloadProgress, bar: HTMLProgressElement, detail: HTMLElement): void {
+  bar.max = progress.totalBytes
+  if (progress.stage === 'hash') {
+    bar.removeAttribute('value')
+    detail.textContent = `${bytes(progress.totalBytes)} generated. Computing expected SHA-256; the browser does not report hash progress.`
+  } else {
+    bar.value = progress.completedBytes
+    const percent = Math.floor(progress.completedBytes / progress.totalBytes * 100)
+    detail.textContent = `${bytes(progress.completedBytes)} / ${bytes(progress.totalBytes)} generated (${percent}%).`
+  }
 }
 
 function badge(id: string, value: string, kind = ''): void {
@@ -527,6 +552,7 @@ function updateControls(): void {
   element<HTMLButtonElement>('download-diagnostics').disabled = busy || reportsBusy
   element<HTMLButtonElement>('clear-diagnostics').disabled = busy || reportsBusy
   element('diagnostic-warning').hidden = !diagnosticsEnabled()
+  element('preparation-active').hidden = !preparing
   settingsFields.disabled = running || preparing || cleaning
   connectButton.disabled = !supported || busy || client.connected
   disconnectButton.disabled = (!client.connected && !connecting) || preparing || cleaning || disconnecting
@@ -611,6 +637,9 @@ function discardPrepared(status: string): void {
   preparedFiles = undefined
   preparationProgress.value = 0
   element('preparation-status').textContent = status
+  element('preparation-count').textContent = 'Files ready: 0'
+  element('preparation-current').hidden = true
+  element('preparation-elapsed').hidden = true
 }
 
 discardPreparedButton.addEventListener('click', () => {
@@ -630,6 +659,13 @@ prepareButton.addEventListener('click', async () => {
   const snapshot = settings
   discardPrepared('Generating payloads and expected hashes. Do not start recording yet.')
   preparing = true
+  const started = performance.now()
+  const showElapsed = (): void => {
+    element('preparation-elapsed').textContent = `Elapsed: ${((performance.now() - started) / 1000).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} s`
+  }
+  element('preparation-elapsed').hidden = false
+  showElapsed()
+  const elapsedTimer = setInterval(showElapsed, 250)
   const cancellation = new AbortController()
   preparationController = cancellation
   message('app-error', '')
@@ -637,11 +673,19 @@ prepareButton.addEventListener('click', async () => {
   let service: PayloadService | undefined
   try {
     service = createPayloadService()
-    preparedFiles = await PreparedFiles.prepare(snapshot, service, cancellation.signal, (completed, total) => {
+    preparedFiles = await PreparedFiles.prepare(snapshot, service, cancellation.signal, (completed, total, current) => {
       preparationProgress.max = total
       preparationProgress.value = completed
-      element('preparation-status').textContent = `Preparing ${completed.toLocaleString()} / ${total.toLocaleString()} files, including expected SHA-256. No USB transfers.`
+      element('preparation-count').textContent = `Files ready: ${completed.toLocaleString()} / ${total.toLocaleString()} (generated and hashed)`
+      if (current) {
+        const file = current.file === 0 ? 'capability probe' : `file ${current.file.toLocaleString()} / ${total.toLocaleString()}`
+        const status = current.stage === 'hash' ? `Computing expected SHA-256 for ${file}.` : `Generating ${file}.`
+        if (element('preparation-status').textContent !== status) element('preparation-status').textContent = status
+        element('preparation-current').hidden = false
+        renderPayloadProgress(current, preparationFileProgress, element('preparation-detail'))
+      }
     })
+    element('preparation-current').hidden = true
     element('preparation-status').textContent = `Ready. ${bytes(retainedPayloadBytes(snapshot))} of payloads prepared. Start your external recording, then click Start transfer after connecting.`
   } catch (error) {
     discardPrepared(cancellation.signal.aborted ? 'Preparation canceled. No USB transfers were started.'
@@ -651,6 +695,8 @@ prepareButton.addEventListener('click', async () => {
       message('app-error', errorMessage(error))
     }
   } finally {
+    clearInterval(elapsedTimer)
+    showElapsed()
     service?.dispose()
     preparing = false
     preparationController = undefined
@@ -726,6 +772,10 @@ function updateLive(): void {
   element('metric-integrity').textContent = `${passedFiles.toLocaleString()} / ${expectedFiles.toLocaleString()}`
   element('metric-upload').textContent = rate(uploadedBytes, uploadMs)
   element('metric-download').textContent = rate(downloadedBytes, downloadMs)
+  element('live-payload').hidden = lastProgress?.payload === undefined
+  if (lastProgress?.payload) {
+    renderPayloadProgress(lastProgress.payload, element<HTMLProgressElement>('live-payload-progress'), element('live-payload-detail'))
+  }
   if (lastProgress) {
     progressBar.max = Math.max(1, lastProgress.total)
     progressBar.value = lastProgress.completed

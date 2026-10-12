@@ -24,6 +24,48 @@ class FakeWorker {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('browser worker payload service (simulated worker transport)', () => {
+  it('delivers intermediate progress without settling the request or dropping its eventual payload', async () => {
+    vi.stubGlobal('Worker', FakeWorker)
+    const service = createPayloadService()
+    const progress = vi.fn()
+    let settled = false
+    const prepared = service.prepare(8, 'seed', 1, progress).then((value) => { settled = true; return value })
+    const worker = FakeWorker.latest
+    const { id } = worker.messages[0]
+    expect(worker.messages[0]).toMatchObject({ reportProgress: true })
+    worker.respond({ id, operation: 'progress', progress: { stage: 'generate', completedBytes: 4, totalBytes: 8 } })
+    worker.respond({ id, operation: 'progress', progress: { stage: 'hash', completedBytes: 8, totalBytes: 8 } })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    expect(progress).toHaveBeenCalledTimes(2)
+    expect(progress).toHaveBeenLastCalledWith({ stage: 'hash', completedBytes: 8, totalBytes: 8 })
+    worker.respond({ id, operation: 'prepare', buffer: new ArrayBuffer(8), sha256: 'expected' })
+    expect((await prepared).bytes.byteLength).toBe(8)
+    worker.respond({ id, operation: 'progress', progress: { stage: 'generate', completedBytes: 8, totalBytes: 8 } })
+    expect(progress).toHaveBeenCalledTimes(2)
+    service.dispose()
+  })
+
+  it('ignores queued progress after disposal and rejects a throwing progress consumer', async () => {
+    vi.stubGlobal('Worker', FakeWorker)
+    let service = createPayloadService()
+    const progress = vi.fn()
+    const canceled = expect(service.prepare(8, 'seed', 1, progress)).rejects.toThrow('disposed')
+    let worker = FakeWorker.latest
+    let id = worker.messages[0].id
+    service.dispose()
+    worker.respond({ id, operation: 'progress', progress: { stage: 'hash', completedBytes: 8, totalBytes: 8 } })
+    await canceled
+    expect(progress).not.toHaveBeenCalled()
+    service = createPayloadService()
+    const failed = expect(service.prepare(8, 'seed', 1, () => { throw new Error('progress failed') })).rejects.toThrow('progress failed')
+    worker = FakeWorker.latest
+    id = worker.messages[0].id
+    worker.respond({ id, operation: 'progress', progress: { stage: 'generate', completedBytes: 0, totalBytes: 8 } })
+    await failed
+    service.dispose()
+  })
+
   it('returns generated buffers and transfers receive buffers to hashing', async () => {
     vi.stubGlobal('Worker', FakeWorker)
     const service = createPayloadService()

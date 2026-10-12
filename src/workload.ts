@@ -110,7 +110,9 @@ export function estimateWorkload(settings: Settings): {
 
 // Versioned FNV-1a seeding and Mulberry32 output, stored little-endian.
 // This is reproducible synthetic data, not a cryptographic random generator.
-export function generatePayloadBytes(size: number, seed: string, index: number): Uint8Array<ArrayBuffer> {
+export function generatePayloadBytes(
+  size: number, seed: string, index: number, onProgress?: (completedBytes: number) => void,
+): Uint8Array<ArrayBuffer> {
   positiveInteger(size, 'Payload size', LIMITS.maxFileBytes)
   boundedText(seed, 'Seed', 256, true)
   if (!Number.isSafeInteger(index) || index < 0) throw new Error('File index must be a nonnegative safe integer.')
@@ -120,19 +122,33 @@ export function generatePayloadBytes(size: number, seed: string, index: number):
   for (const byte of identity) state = Math.imul(state ^ byte, 0x01000193) >>> 0
   const identityByte = (state ^ index) & 0xff
   for (const byte of encoder.encode(String(index))) state = Math.imul(state ^ byte, 0x01000193) >>> 0
+  onProgress?.(0)
   const bytes = new Uint8Array(size)
-  for (let offset = 0; offset < size; offset += 4) {
-    state = (state + 0x6d2b79f5) >>> 0
-    let value = state
-    value = Math.imul(value ^ (value >>> 15), value | 1)
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61)
-    value = (value ^ (value >>> 14)) >>> 0
-    for (let lane = 0; lane < 4 && offset + lane < size; lane++) {
-      bytes[offset + lane] = (value >>> (lane * 8)) & 0xff
+  let lastProgress = onProgress ? performance.now() : 0
+  // Check progress between aligned blocks, not on the PRNG's hot inner loop.
+  for (let block = 0; block < size; block += 1024 ** 2) {
+    const end = Math.min(size, block + 1024 ** 2)
+    for (let offset = block; offset < end; offset += 4) {
+      state = (state + 0x6d2b79f5) >>> 0
+      let value = state
+      value = Math.imul(value ^ (value >>> 15), value | 1)
+      value ^= value + Math.imul(value ^ (value >>> 7), value | 61)
+      value = (value ^ (value >>> 14)) >>> 0
+      for (let lane = 0; lane < 4 && offset + lane < size; lane++) {
+        bytes[offset + lane] = (value >>> (lane * 8)) & 0xff
+      }
+    }
+    if (onProgress && end < size) {
+      const now = performance.now()
+      if (now - lastProgress >= 100) {
+        onProgress(end)
+        lastProgress = now
+      }
     }
   }
   // Keep all 100 workload file identities distinct even for one-byte files.
   bytes[0] = identityByte
+  onProgress?.(size)
   return bytes
 }
 

@@ -152,6 +152,15 @@ free-space check still run at transfer time. SHA-256 hashing of data read back
 from the phone also remains runtime work; pre-generation does not skip readback
 or verification.
 
+Preparation shows the current file, byte count and percentage while generating,
+then a separate **Computing expected SHA-256** stage. A completed-file counter,
+activity indicator and elapsed time remain visible during long preparations.
+Hashing uses the browser's SHA-256 API, which has no incremental progress: its
+indicator is intentionally indeterminate, not a fabricated percentage. Worker
+byte updates are throttled to roughly ten per second; payload bytes and hashes
+are unchanged. On-demand generation also shows per-file progress in the live
+transfer panel.
+
 Retained prepared file payload is capped at **1 GiB total**, plus the tiny probe.
 Without reuse, this is `file size × file count × rounds`; with reuse, it is
 `file size × file count`. Pre-generation also caps the number of retained
